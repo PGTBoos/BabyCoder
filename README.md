@@ -73,6 +73,10 @@ This is helpfull towards keeping smaller llm's on track without derailing of the
 pip install requests
 # needs a local LM Studio instance running, or point it at another model
 python coder_agent.py
+
+# later agent_room will be runner (also architect_agent can be run)
+# the idea is the room will follow some python based loop, inbetween agents.
+# agent toolkit contains all the commands and tricks, agents can get a set of allowed tools depending their role.
 ```
 
 ## Open question
