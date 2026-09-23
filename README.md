@@ -1,19 +1,29 @@
-# BabyCoder  
-AST-based coding, structured edits instead of raw diffs, sandboxed by default.  
-(light) Sandboxed Multi-Agent Coding Toolkit.   
-Written for smaller tool-calling LLMs, improving to keep them on track while writing code.  
-Agents live in (light) folder-based isolation, though it's still your pc, keep that in mind.  
+> *AST-based (Abstract Syntax Tree) coding, with tool-based structured edits instead of raw diffs and context length limits.
+> Sandboxed by default; a (light weight) Sandboxed Multi-Agent Coding Toolkit.     
+> Python as a layer in between the agent and code access, also for automated feedback towards the agent.  
+> Written for smaller tool-calling LLMs, improving to keep them on track while writing code.   
+> Agents live in (light) folder-based isolation, though it's still your pc, keep that in mind.*  
+>   
+> **Status: proof of concept, work in progress.**   
+> *It works, it's small, and there's an obvious next step that isn't built yet (see below).*  
 
-
-
-**Status: proof of concept, work in progress.** 
-It works, it's small, and there's an obvious next step that isn't built yet (see below).  
-
-### What is it?
-
-Instead of "here's a patch, apply it," the model calls tools, and python code does the actual edit.
+## Why I built this
+Small, local LLMs can write code, but they lean hard on their own content/memory skills to do it.  
+And that's exactly where they're weakest.   
+Ask one to hold a whole file in mind while also writing correct code, and they start forgetting what it already wrote.  
+And they reintroduce bugs it just fixed, drift from the actual goal, or go into loops of thought.  
+ 
+**The idea here:** stop asking it to remember the code at all. 
+Give a tool-calling LLM a way to operate on code through a Python add/remove/update chain instead,  
+so the file lives in Python, not in the model's limited context.   
+That frees it from needing the whole file in memory, and it opens the door to working through a to-do list.  
+One small task at a time instead of holding an entire plan in its head for the length of a long session.  
+ 
+## What is it?
+ 
+Instead of "here's a patch, apply it," the model calls tools, and Python code does the actual edit.
 Not the LLM trying to do so out of its small llm memory. A few of them:
-
+ 
 - `list("symbols", "file.py")` - see what's in a file before touching it
 - `read_symbol("foo")` - pull just one function or class, not the whole file
 - `update_symbol("foo", new_code)` - rewrite it; syntax is checked first, bad edits are rejected
@@ -21,7 +31,6 @@ Not the LLM trying to do so out of its small llm memory. A few of them:
 - `check_syntax("file.py")` - confirm the file still parses
 - `run_command("pytest")` - runs a shell command, but only after you type "y"
 - *...etc a lot more of such functions*
-
 In theory, it can rewrite one function in a huge codebase without the LLM ever needing the whole file in its context.
 
 Right now there are two agents:
@@ -74,7 +83,8 @@ Opinions welcome.
 
 *I think to keep the coder working till execute, maybe add another command when it's ready then handover to architect for a next todo*
 *So agents can do multiple run's, but the switch towards another agent should happen only when (after multiple turns) agent A is ready*
-*some user intervention should though as well be possible*.
+*some user intervention should though as well be possible*. 
+***Agent room** will be the place that will bind it together, though coder agent can run on its own for now.*
 
 
 
