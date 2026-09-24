@@ -728,6 +728,95 @@ def _resolve_backend(path: str, language: str = None) -> LanguageBackend:
 # 2. Language-agnostic tools
 # ---------------------------------------------------------------------------
 
+def _iter_project_files(path: str = ".", file_glob: str = None, language: str = None):
+    """Yield (rel_path, full_path) for every non-hidden file under `path`,
+    the same walk search_files has always done (hidden dirs and files
+    skipped), optionally narrowed by a filename glob and/or to one
+    language by extension. `path` may also be a single file. Sorted, so a
+    project-wide result comes out in the same order run to run, which
+    matters when a model compares two results against each other.
+
+    Every yielded file is re-checked with _full_path: os.walk lists a
+    symlink inside the sandbox by its own name, not by where it points,
+    so without this a link to somewhere outside WORKDIR would be walked
+    into like any other file. Files failing that check are left out.
+    """
+    root = _full_path(path)
+    if os.path.isfile(root):
+        candidates = [root]
+    else:
+        candidates = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for fname in sorted(filenames):
+                if not fname.startswith("."):
+                    candidates.append(os.path.join(dirpath, fname))
+    for full in candidates:
+        fname = os.path.basename(full)
+        if file_glob and not fnmatch.fnmatch(fname, file_glob):
+            continue
+        if language is not None:
+            ext = os.path.splitext(fname)[1].lower()
+            if EXTENSION_TO_LANGUAGE.get(ext) != language:
+                continue
+        rel = os.path.relpath(full, WORKDIR)
+        try:
+            _full_path(rel)
+        except ValueError:
+            continue
+        yield rel, full
+
+
+MAX_READ_LINES = 400
+
+
+def read_lines(path: str, start: int = 1, end: int = None) -> str:
+    """Read a 1-based, inclusive line range of a file, each line prefixed
+    with its number, for files too large to read_file in one go or when
+    only one region matters. Capped at MAX_READ_LINES per call; the
+    result says where to continue when it was cut short."""
+    full = _full_path(path)
+    if not os.path.exists(full):
+        return f"ERROR: {path} does not exist"
+    if not os.path.isfile(full):
+        return f"ERROR: {path} is not a file"
+    try:
+        start = int(start) if start is not None else 1
+        end = int(end) if end is not None else None
+    except (TypeError, ValueError):
+        return "ERROR: start and end must be integers"
+    if start < 1:
+        return "ERROR: start must be 1 or higher (lines are numbered from 1)"
+    if end is not None and end < start:
+        return f"ERROR: end ({end}) is before start ({start})"
+
+    last_wanted = start + MAX_READ_LINES - 1
+    if end is not None:
+        last_wanted = min(end, last_wanted)
+
+    picked = []
+    total = 0
+    # Streams the file instead of reading it whole, only the requested
+    # window is kept. The loop still runs to the end to count the total,
+    # so the model knows how far the file actually goes.
+    with open(full, "r", encoding="utf-8", errors="replace") as f:
+        for lineno, line in enumerate(f, 1):
+            total = lineno
+            if start <= lineno <= last_wanted:
+                picked.append((lineno, line.rstrip("\n")))
+    if not picked:
+        return f"(file has {total} line(s), nothing at line {start} or later)"
+
+    shown_to = picked[-1][0]
+    width = len(str(shown_to))
+    body = "\n".join(f"{n:>{width}}: {text}" for n, text in picked)
+    wanted_to = min(end if end is not None else total, total)
+    if shown_to < wanted_to:
+        body += (f"\n[CUT at {MAX_READ_LINES} lines, continue with "
+                 f"read_lines(path='{path}', start={shown_to + 1})]")
+    return f"[{path}: lines {start}-{shown_to} of {total}]\n{body}"
+
+
 def read_file(path: str) -> str:
     full = _full_path(path)
     if not os.path.exists(full):
@@ -760,7 +849,18 @@ def list_dir(path: str = ".") -> str:
     return "\n".join(entries) if entries else "(empty)"
 
 
-def search_files(pattern: str, path: str = ".", regex: bool = False, max_results: int = 100) -> str:
+def search_files(pattern: str, path: str = ".", regex: bool = False, max_results: int = 100,
+                 file_glob: str = None, context_lines: int = 0) -> str:
+    """Substring (or regex) search over file contents, one line per match
+    as path:line: text. file_glob narrows which files are searched by
+    filename (e.g. '*.py'). context_lines > 0 adds that many lines before
+    and after each match, grep-style: ':' around the line number marks a
+    matching line, '-' a context line, and '--' separates groups that
+    aren't adjacent. max_results counts matches, not printed lines.
+
+    Walks via _iter_project_files, which re-checks every file against the
+    sandbox; the old os.walk loop opened files directly, so a symlink
+    inside the sandbox pointing outside it could be read through here."""
     root = _full_path(path)
     if not os.path.exists(root):
         return f"ERROR: {path} does not exist"
@@ -768,23 +868,46 @@ def search_files(pattern: str, path: str = ".", regex: bool = False, max_results
         matcher = re.compile(pattern if regex else re.escape(pattern))
     except re.error as exc:
         return f"ERROR: bad pattern: {exc}"
+    try:
+        context_lines = max(0, int(context_lines or 0))
+    except (TypeError, ValueError):
+        context_lines = 0
+
     results = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        for fname in filenames:
-            if fname.startswith("."):
-                continue
-            fpath = os.path.join(dirpath, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                    for i, line in enumerate(f, 1):
-                        if matcher.search(line):
-                            rel = os.path.relpath(fpath, WORKDIR)
-                            results.append(f"{rel}:{i}: {line.rstrip()}")
-                            if len(results) >= max_results:
-                                return "\n".join(results) + f"\n... (truncated at {max_results})"
-            except OSError:
-                continue
+    matches = 0
+    truncated = f"\n... (truncated at {max_results} matches)"
+    for rel, full in _iter_project_files(path, file_glob):
+        try:
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                lines = [l.rstrip("\n") for l in f]
+        except OSError:
+            continue
+        hit_lines = [i for i, line in enumerate(lines) if matcher.search(line)]
+        if not hit_lines:
+            continue
+
+        # Each match plus its context becomes a window; a window that
+        # touches or overlaps the previous one is merged into it, so a run
+        # of nearby matches prints as one block instead of repeating lines.
+        windows = []
+        for i in hit_lines:
+            lo, hi = max(0, i - context_lines), min(len(lines) - 1, i + context_lines)
+            if windows and lo <= windows[-1][1] + 1:
+                windows[-1][1] = max(windows[-1][1], hi)
+            else:
+                windows.append([lo, hi])
+
+        hit_set = set(hit_lines)
+        for lo, hi in windows:
+            if context_lines and results:
+                results.append("--")
+            for j in range(lo, hi + 1):
+                mark = ":" if j in hit_set else "-"
+                results.append(f"{rel}{mark}{j + 1}{mark} {lines[j].rstrip()}")
+                if j in hit_set:
+                    matches += 1
+                    if matches >= max_results:
+                        return "\n".join(results) + truncated
     return "\n".join(results) if results else "(no matches)"
 
 
@@ -896,6 +1019,244 @@ def format_file(path: str) -> str:
     return f"OK: formatted {path}"
 
 
+# ---------------------------------------------------------------------------
+# File lifecycle: delete / move / copy / make_dir. Each takes one exact
+# path, never a pattern, and never the sandbox root itself. The normal
+# _full_path rules still apply on top (relative only, no traversal, no
+# symlink escape). Anything that removes content from a path is backed up
+# first, same as every other write in this file, so restore_backup can
+# undo it.
+# ---------------------------------------------------------------------------
+
+def _exact_target(path: str) -> str:
+    """_full_path plus the stricter rules the lifecycle tools want: no
+    glob characters, since these act on exactly one path, and not the
+    sandbox root, since deleting or moving '.' would take the whole
+    project with it."""
+    if isinstance(path, str) and any(c in path for c in "*?["):
+        raise ValueError(f"exact path required, no wildcards: {path}")
+    full = _full_path(path)
+    if full == WORKDIR:
+        raise ValueError("the sandbox root itself can't be the target of this operation")
+    return full
+
+
+def _missing_file_hint(path: str, full: str) -> str:
+    parent = os.path.dirname(full)
+    siblings = os.listdir(parent) if os.path.isdir(parent) else []
+    return _fuzzy_hint(os.path.basename(path), siblings)
+
+
+def delete_file(path: str) -> str:
+    """Delete one file (not a directory). Backed up first."""
+    try:
+        full = _exact_target(path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if not os.path.exists(full):
+        return _soft_not_found("file", path, _missing_file_hint(path, full))
+    if not os.path.isfile(full):
+        return f"ERROR: {path} is a directory, delete_file only removes single files"
+    _backup(path)
+    try:
+        os.remove(full)
+    except OSError as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    return f"OK: deleted {path} (backed up first, restore_backup can bring it back)"
+
+
+def _check_src_dst(src: str, dst: str):
+    """Shared checks for move_file and copy_file. Returns
+    (full_src, full_dst, None) when both are usable, otherwise
+    (None, None, result string to hand back as-is)."""
+    try:
+        full_src = _exact_target(src)
+        full_dst = _exact_target(dst)
+    except ValueError as exc:
+        return None, None, f"ERROR: {exc}"
+    if not os.path.exists(full_src):
+        # Soft, not ERROR: a missing source with the destination already
+        # in place is usually this same step having been done before.
+        hint = ("The destination already exists, so this may already have been done."
+                if os.path.exists(full_dst) else _missing_file_hint(src, full_src))
+        return None, None, _soft_not_found("file", src, hint)
+    if not os.path.isfile(full_src):
+        return None, None, f"ERROR: {src} is a directory, only single files can be moved or copied"
+    if full_src == full_dst:
+        return None, None, "ERROR: source and destination are the same file"
+    if os.path.exists(full_dst):
+        # Refused instead of overwritten: replacing an existing file stays
+        # an explicit delete_file first, never a side effect of a move.
+        return None, None, (
+            f"ERROR: {dst} already exists. dst must be the full new file path "
+            f"(not a folder to move into); use delete_file first if replacing it is intended."
+        )
+    return full_src, full_dst, None
+
+
+def move_file(src: str, dst: str) -> str:
+    """Move or rename one file. Missing parent folders of dst are created.
+    The source is backed up first, so restore_backup can put it back."""
+    full_src, full_dst, err = _check_src_dst(src, dst)
+    if err:
+        return err
+    _backup(src)
+    try:
+        os.makedirs(os.path.dirname(full_dst), exist_ok=True)
+        shutil.move(full_src, full_dst)
+    except OSError as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    note = ""
+    if EXTENSION_TO_LANGUAGE.get(os.path.splitext(src)[1].lower()) == "python":
+        old_module = os.path.splitext(os.path.basename(src))[0]
+        note = (f" Imports of '{old_module}' elsewhere were NOT updated; check with "
+                f"search_files(pattern='{old_module}') before assuming nothing refers to it.")
+    return f"OK: moved {src} to {dst}.{note}"
+
+
+def copy_file(src: str, dst: str) -> str:
+    """Copy one file to a new path. Missing parent folders of dst are created."""
+    full_src, full_dst, err = _check_src_dst(src, dst)
+    if err:
+        return err
+    try:
+        os.makedirs(os.path.dirname(full_dst), exist_ok=True)
+        shutil.copy2(full_src, full_dst)
+    except OSError as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    return f"OK: copied {src} to {dst}"
+
+
+def make_dir(path: str) -> str:
+    """Create a directory, plus any missing parents."""
+    try:
+        full = _exact_target(path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if os.path.isdir(full):
+        return f"OK: {path} already exists"
+    if os.path.exists(full):
+        return f"ERROR: {path} already exists as a file"
+    try:
+        os.makedirs(full)
+    except OSError as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    return f"OK: created {path}"
+
+
+# ---------------------------------------------------------------------------
+# Diff / review. Read-only; diff_with_backup is the review side of the
+# backup system that already exists, what did an edit actually change.
+# ---------------------------------------------------------------------------
+
+MAX_DIFF_LINES = 400
+
+
+def _unified_diff(a_text: str, b_text: str, a_label: str, b_label: str, context_lines=3):
+    """Unified diff text, capped at MAX_DIFF_LINES, or None if identical."""
+    try:
+        n = max(0, int(context_lines))
+    except (TypeError, ValueError):
+        n = 3
+    diff = list(difflib.unified_diff(
+        a_text.splitlines(), b_text.splitlines(),
+        fromfile=a_label, tofile=b_label, n=n, lineterm="",
+    ))
+    if not diff:
+        return None
+    if len(diff) > MAX_DIFF_LINES:
+        extra = len(diff) - MAX_DIFF_LINES
+        diff = diff[:MAX_DIFF_LINES] + [f"... ({extra} more diff line(s) not shown)"]
+    return "\n".join(diff)
+
+
+def diff_files(path_a: str, path_b: str, context_lines: int = 3) -> str:
+    """Unified diff between two sandbox files, path_a as before, path_b as after."""
+    try:
+        a = _read_source(path_a)
+        b = _read_source(path_b)
+    except (OSError, ValueError) as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    diff = _unified_diff(a, b, path_a, path_b, context_lines)
+    return diff or f"OK: {path_a} and {path_b} are identical"
+
+
+def _read_manifest() -> list:
+    """All backup manifest entries, oldest first, skipping unreadable
+    lines, the same tolerant parse list_backups and restore_backup do."""
+    entries = []
+    if not os.path.exists(BACKUP_MANIFEST):
+        return entries
+    with open(BACKUP_MANIFEST, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict) and "backup" in entry and "original" in entry:
+                entries.append(entry)
+    return entries
+
+
+def _same_sandbox_path(a: str, b: str) -> bool:
+    """True if two model-supplied paths name the same file. The manifest
+    stores whatever spelling was used at write time ('foo.py', './foo.py'),
+    so a plain string compare would miss backups taken under another one."""
+    try:
+        return _full_path(a) == _full_path(b)
+    except ValueError:
+        return a == b
+
+
+def diff_with_backup(path: str = None, backup: str = None, context_lines: int = 3) -> str:
+    """Diff a backup against the current state of the file it came from.
+    With backup=<name from list(target='backups')>, that backup is used.
+    With only path, the most recent backup of that file is used; since a
+    backup is taken right before each write, that shows exactly what the
+    last edit to the file changed."""
+    entries = _read_manifest()
+    if backup:
+        if os.sep in backup or "/" in backup or "\\" in backup or backup in (".", ".."):
+            return f"ERROR: invalid backup name: {backup}"
+        match = next((e for e in reversed(entries) if e["backup"] == backup), None)
+        if match is None:
+            return _soft_not_found("backup", backup, _fuzzy_hint(backup, [e["backup"] for e in entries]))
+    elif path:
+        match = next((e for e in reversed(entries) if _same_sandbox_path(e["original"], path)), None)
+        if match is None:
+            return _soft_not_found(
+                "backup of", path,
+                "No write to this file has been backed up yet (a file's very first "
+                "write has nothing to back up), so there is nothing to diff against.",
+            )
+    else:
+        return ("ERROR: give path or backup. Usage: diff_with_backup(path='file.py') or "
+                "diff_with_backup(backup='<name from list(target=\"backups\")>')")
+
+    backup_file = os.path.join(BACKUP_DIR, match["backup"])
+    if not os.path.isfile(backup_file):
+        return f"ERROR: backup file {match['backup']} is missing on disk"
+    try:
+        with open(backup_file, "r", encoding="utf-8") as f:
+            old = f.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+    original = match["original"]
+    try:
+        current = _read_source(original)
+        current_label = f"{original} (current)"
+    except FileNotFoundError:
+        current = ""
+        current_label = f"{original} (current: file no longer exists)"
+    except (OSError, ValueError) as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+    diff = _unified_diff(old, current, f"{original} (backup {match['backup']})",
+                         current_label, context_lines)
+    return diff or f"OK: {original} is identical to backup {match['backup']}"
+
+
 REQUIREMENTS_PATH = "requirements.txt"
 
 
@@ -925,6 +1286,94 @@ def add_dependency(name: str, version: str = None, language: str = None) -> str:
     new_content += entry + "\n"
     _write_source(REQUIREMENTS_PATH, new_content)
     return f"OK: added '{entry}' to requirements.txt"
+
+
+def _requirement_key(name: str) -> str:
+    """pip treats 'Foo_Bar', 'foo-bar' and 'foo.bar' as the same package
+    (PEP 503 normalization), so a raw string compare would miss a line
+    spelled differently from how the model asked for it."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+_REQUIREMENT_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._\-]*)(\[[^\]]*\])?(.*)$")
+
+
+def _find_requirement(lines: list, name: str):
+    """(index, regex match) of the requirements.txt line declaring `name`,
+    or (None, None). Blank lines, comments and pip options (-r, -e,
+    --index-url ...) are never treated as a package line."""
+    key = _requirement_key(name)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "-")):
+            continue
+        m = _REQUIREMENT_LINE_RE.match(stripped)
+        if m and _requirement_key(m.group(1)) == key:
+            return i, m
+    return None, None
+
+
+def _requirement_names(lines: list) -> list:
+    names = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("#", "-")):
+            m = _REQUIREMENT_LINE_RE.match(stripped)
+            if m:
+                names.append(m.group(1))
+    return names
+
+
+def remove_dependency(name: str, language: str = None) -> str:
+    language = language or "python"
+    if language != "python":
+        return f"ERROR: dependency management for {language} not implemented yet"
+    if not os.path.exists(_full_path(REQUIREMENTS_PATH)):
+        return _soft_not_found("dependency", name, "There is no requirements.txt at all, so nothing to remove.")
+    lines = _read_source(REQUIREMENTS_PATH).splitlines()
+    idx, _ = _find_requirement(lines, name)
+    if idx is None:
+        return _soft_not_found("dependency", name, _fuzzy_hint(name, _requirement_names(lines)))
+    removed = lines.pop(idx).strip()
+    _write_source(REQUIREMENTS_PATH, "\n".join(lines) + ("\n" if lines else ""))
+    return f"OK: removed '{removed}' from requirements.txt"
+
+
+def update_dependency(name: str, version: str = None, language: str = None) -> str:
+    """Change the version of a dependency already in requirements.txt.
+    A bare version ('2.31.0') is pinned with ==, a full specifier
+    ('>=2.0,<3') is used as-is, no version unpins it. Extras ([socks]),
+    an environment marker (; python_version ...) and a trailing comment
+    on that line are kept."""
+    language = language or "python"
+    if language != "python":
+        return f"ERROR: dependency management for {language} not implemented yet"
+    if not os.path.exists(_full_path(REQUIREMENTS_PATH)):
+        return _soft_not_found("dependency", name, "There is no requirements.txt yet; use add_dependency.")
+    lines = _read_source(REQUIREMENTS_PATH).splitlines()
+    idx, m = _find_requirement(lines, name)
+    if idx is None:
+        hint = _fuzzy_hint(name, _requirement_names(lines))
+        return _soft_not_found("dependency", name, hint + " Use add_dependency if it isn't listed yet.")
+
+    pkg, extras, rest = m.group(1), m.group(2) or "", m.group(3)
+    comment = ""
+    hash_at = rest.find(" #")
+    if hash_at >= 0:
+        rest, comment = rest[:hash_at], "  " + rest[hash_at:].strip()
+    marker = ""
+    if ";" in rest:
+        marker = "; " + rest.split(";", 1)[1].strip()
+
+    v = (version or "").strip()
+    spec = "" if not v else (v if v[0] in "<>=!~" else f"=={v}")
+    old_line = lines[idx].strip()
+    new_line = f"{pkg}{extras}{spec}{marker}{comment}"
+    if new_line == old_line:
+        return f"OK: '{old_line}' already matches, nothing changed"
+    lines[idx] = new_line
+    _write_source(REQUIREMENTS_PATH, "\n".join(lines) + "\n")
+    return f"OK: '{old_line}' -> '{new_line}' in requirements.txt"
 
 
 def lookup_symbol_docs(symbol: str, language: str = None) -> str:
@@ -1086,6 +1535,207 @@ def find_references(path: str, name: str, scope: str = None, language: str = Non
 
 def check_syntax(path: str, language: str = None) -> str:
     return _resolve_backend(path, language).check_syntax(path)
+
+
+# ---------------------------------------------------------------------------
+# 3 (continued). Project-wide symbol tools. The per-file tools above answer
+#     "what is in this file"; these answer "where in the project", which a
+#     coder needs as soon as a change crosses a file boundary. They walk
+#     every file under `path` (default: the whole sandbox) and reuse the
+#     Python backend per file, so a symbol or a reference means exactly
+#     what it means in the single-file tools, just applied more than once.
+#     Python only, like the backends; other languages are skipped rather
+#     than guessed at. A file that doesn't parse is reported, not silently
+#     dropped, since "not found in a broken file" is not "not there".
+# ---------------------------------------------------------------------------
+
+MAX_PROJECT_RESULTS = 300
+
+
+def _project_result(lines: list, unparsed: list, empty: str) -> str:
+    if len(lines) > MAX_PROJECT_RESULTS:
+        extra = len(lines) - MAX_PROJECT_RESULTS
+        lines = lines[:MAX_PROJECT_RESULTS] + [f"... ({extra} more not shown, narrow with path=)"]
+    text = "\n".join(lines) if lines else empty
+    if unparsed:
+        text += "\n[NOTE] could not parse, so not searched: " + ", ".join(unparsed)
+    return text
+
+
+def list_project_symbols(path: str = ".") -> str:
+    """Every function/class/method in every Python file under `path`, one
+    line each as path:line: kind name (methods as Class.method)."""
+    if not os.path.exists(_full_path(path)):
+        return f"ERROR: {path} does not exist"
+    backend = LANGUAGE_BACKENDS["python"]
+    out, unparsed = [], []
+    for rel, _ in _iter_project_files(path, language="python"):
+        try:
+            symbols = json.loads(backend.list_symbols(rel))
+        except (SyntaxError, ValueError, OSError):
+            unparsed.append(rel)
+            continue
+        for s in symbols:
+            qual = f"{s['scope']}.{s['name']}" if s.get("scope") else s["name"]
+            out.append(f"{rel}:{s['line']}: {s['kind']} {qual}")
+    return _project_result(out, unparsed, f"(no Python symbols found under {path})")
+
+
+def find_definition(name: str, path: str = ".", scope: str = None) -> str:
+    """Where `name` is defined as a function, class or method anywhere
+    under `path`. Without scope, a method of that name in any class counts
+    too (reported as Class.method); with scope, only that class's method.
+    Every hit is listed: two files defining the same name is exactly what
+    a coder needs to see before editing the wrong one."""
+    if not os.path.exists(_full_path(path)):
+        return f"ERROR: {path} does not exist"
+    hits, all_names, unparsed = [], [], []
+    for rel, _ in _iter_project_files(path, language="python"):
+        try:
+            tree = ast.parse(_read_source(rel))
+        except (SyntaxError, ValueError, OSError):
+            unparsed.append(rel)
+            continue
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            all_names.append(node.name)
+            if node.name == name and scope is None:
+                kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                hits.append(f"{rel}:{node.lineno}: {kind} {node.name}")
+            if isinstance(node, ast.ClassDef):
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        all_names.append(child.name)
+                        if child.name == name and scope in (None, node.name):
+                            hits.append(f"{rel}:{child.lineno}: method {node.name}.{child.name}")
+    if not hits:
+        subject = f"definition{f' in scope {scope}' if scope else ''} under {path}"
+        result = _soft_not_found(subject, name, _fuzzy_hint(name, all_names))
+        if unparsed:
+            result += " [NOTE] could not parse, so not searched: " + ", ".join(unparsed)
+        return result
+    return _project_result(hits, unparsed, "")
+
+
+def find_references_in_project(name: str, path: str = ".") -> str:
+    """find_references applied to every Python file under `path`: actual
+    name/attribute usages, not text matches. The thing to run before
+    rename_symbol_in_project or a signature change, to see every call
+    site that has to follow along."""
+    if not os.path.exists(_full_path(path)):
+        return f"ERROR: {path} does not exist"
+    backend = LANGUAGE_BACKENDS["python"]
+    out, unparsed = [], []
+    for rel, _ in _iter_project_files(path, language="python"):
+        try:
+            result = backend.find_references(rel, name)
+        except (SyntaxError, ValueError, OSError):
+            unparsed.append(rel)
+            continue
+        if not result.startswith("(no references"):
+            out.extend(result.splitlines())
+    return _project_result(out, unparsed, f"(no references to {name} found under {path})")
+
+
+def _token_rename(source: str, old_name: str, new_name: str):
+    """The same token-based rename PythonBackend.rename_symbol does (strings
+    and comments untouched), as a pure function over source text. Returns
+    (new_source, count, names), names being every identifier token in the
+    ORIGINAL source, for the collision check in rename_symbol_in_project.
+    Raises tokenize.TokenError / SyntaxError on untokenizable source."""
+    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    line_starts = [0]
+    for line in source.splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(line))
+    names = set()
+    edits = []
+    for tok in tokens:
+        if tok.type == tokenize.NAME:
+            names.add(tok.string)
+            if tok.string == old_name:
+                (sr, sc), (er, ec) = tok.start, tok.end
+                edits.append((line_starts[sr - 1] + sc, line_starts[er - 1] + ec))
+    new_source = source
+    for start, end in reversed(edits):
+        new_source = new_source[:start] + new_name + new_source[end:]
+    return new_source, len(edits), names
+
+
+def rename_symbol_in_project(old_name: str, new_name: str, path: str = ".",
+                             file_glob: str = None) -> str:
+    """Token-based rename across every Python file under `path`, all or
+    nothing: every affected file is renamed in memory and re-parsed first,
+    and only when all of them still parse is anything written. A rename
+    that fixed eight files and broke the ninth would leave the project
+    worse off than both before and after.
+
+    Refused, not just warned about, when new_name already is an identifier
+    in a file that would be touched: after a token rename the old and new
+    name can't be told apart anymore, so two distinct things would
+    silently merge into one. If that merge is really intended, the
+    single-file rename_symbol still does it.
+
+    Same limit as rename_symbol: every identifier token spelled old_name
+    is renamed, including an unrelated local or attribute that happens to
+    share it. find_references_in_project shows what will be hit first;
+    narrow with path or file_glob when that is too much."""
+    if not isinstance(new_name, str) or not new_name.isidentifier() or keyword.iskeyword(new_name):
+        return f"ERROR: {new_name!r} is not a valid Python identifier"
+    if old_name == new_name:
+        return "ERROR: old_name and new_name are the same"
+    if not os.path.exists(_full_path(path)):
+        return f"ERROR: {path} does not exist"
+
+    planned = []      # (rel, new_source, count), written only if nothing below failed
+    problems = []
+    collisions = []
+    for rel, _ in _iter_project_files(path, file_glob, language="python"):
+        try:
+            source = _read_source(rel)
+        except (OSError, ValueError) as exc:
+            problems.append(f"{rel}: could not read ({type(exc).__name__})")
+            continue
+        if old_name not in source:
+            continue  # cheap pre-filter, the tokenizer below is the real test
+        try:
+            new_source, count, names = _token_rename(source, old_name, new_name)
+        except (tokenize.TokenError, SyntaxError) as exc:
+            problems.append(f"{rel}: could not tokenize ({exc})")
+            continue
+        if count == 0:
+            continue  # only inside strings/comments, which a rename leaves alone
+        if new_name in names:
+            collisions.append(rel)
+            continue
+        try:
+            ast.parse(new_source)
+        except SyntaxError as exc:
+            problems.append(f"{rel}: would not parse after the rename (line {exc.lineno}: "
+                            f"{exc.msg}); check_syntax it, it may already be broken")
+            continue
+        planned.append((rel, new_source, count))
+
+    if collisions or problems:
+        parts = ["ERROR: rename aborted, nothing was written."]
+        if collisions:
+            parts.append(f"'{new_name}' is already an identifier in: {', '.join(collisions)}.")
+        if problems:
+            parts.append("; ".join(problems))
+        return " ".join(parts)
+    if not planned:
+        return _soft_not_found(
+            f"identifier under {path}", old_name,
+            "Nothing spelled exactly like that is used as an identifier there; "
+            "list(target='project_symbols') shows what does exist.",
+        )
+
+    for rel, new_source, _ in planned:
+        _write_source(rel, new_source)
+    total = sum(c for _, _, c in planned)
+    details = "\n".join(f"{rel}: {c}" for rel, _, c in planned)
+    return (f"OK: renamed {total} occurrence(s) of {old_name} to {new_name} "
+            f"across {len(planned)} file(s)\n{details}")
 
 
 # ---------------------------------------------------------------------------
@@ -1428,6 +2078,10 @@ def _list_backups_target(path=None, language=None):
     return list_backups()
 
 
+def _list_project_symbols_target(path=None, language=None):
+    return list_project_symbols(path or ".")
+
+
 LIST_TARGETS = {
     "symbols": {
         "fn": _list_symbols_target,
@@ -1448,6 +2102,11 @@ LIST_TARGETS = {
     "backups": {
         "fn": _list_backups_target,
         "usage": "list(target='backups') -> available file backups, newest first",
+    },
+    "project_symbols": {
+        "fn": _list_project_symbols_target,
+        "usage": "list(target='project_symbols', path='.') -> every function/class/method "
+                 "in every Python file under a folder, default the whole sandbox",
     },
 }
 
@@ -1492,14 +2151,18 @@ TOOLS = [
           {"path": {"type": "string"}}, ["path"]),
     _tool("write_file", "Create or overwrite a file with given content (a backup is taken first).",
           {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
-    _tool("list", "List something: symbols, imports, dir, dependencies, or backups. One tool "
-                 "covering all five, pick the target and supply path when the target needs one.",
+    _tool("list", "List something: symbols, imports, dir, dependencies, backups, or "
+                 "project_symbols (every symbol in every file under path). One tool covering "
+                 "all six, pick the target and supply path when the target needs one.",
           {"target": {"type": "string", "enum": sorted(LIST_TARGETS.keys())},
            "path": {"type": "string"}, **_LANG_PROP},
           ["target"]),
-    _tool("search_files", "Search file contents for a substring or regex.",
+    _tool("search_files", "Search file contents for a substring or regex. file_glob narrows "
+                          "which files (e.g. *.py); context_lines adds that many lines around "
+                          "each match, grep-style (':' marks a match line, '-' a context line).",
           {"pattern": {"type": "string"}, "path": {"type": "string"},
-           "regex": {"type": "boolean"}, "max_results": {"type": "integer"}},
+           "regex": {"type": "boolean"}, "max_results": {"type": "integer"},
+           "file_glob": {"type": "string"}, "context_lines": {"type": "integer"}},
           ["pattern"]),
     _tool("replace_in_file", "Literal find-replace within one file, not symbol-aware. "
                              "For updating a call pattern written the same way each time "
@@ -1571,6 +2234,54 @@ TOOLS = [
     _tool("run_command", "Propose a shell command. Requires explicit human approval before "
                          "it runs; never assume it ran just because you called this.",
           {"command": {"type": "string"}}, ["command"]),
+    _tool("read_lines", "Read a numbered line range of a file (1-based, inclusive), for large "
+                        "files or one region of interest. Capped per call; the result says "
+                        "where to continue.",
+          {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}},
+          ["path"]),
+    _tool("find_definition", "Find where a function, class or method is defined anywhere under "
+                             "a folder (default: whole project). Without scope, methods of any "
+                             "class match too.",
+          {"name": {"type": "string"}, "path": {"type": "string"}, "scope": {"type": "string"}},
+          ["name"]),
+    _tool("find_references_in_project", "find_references across every Python file under a "
+                                        "folder (default: whole project). Run this before "
+                                        "rename_symbol_in_project or a signature change.",
+          {"name": {"type": "string"}, "path": {"type": "string"}}, ["name"]),
+    _tool("rename_symbol_in_project", "Token-aware rename across every Python file under a "
+                                      "folder, all or nothing: if any file would break, or "
+                                      "already uses new_name, nothing is written. Renames every "
+                                      "identifier spelled old_name, so check "
+                                      "find_references_in_project first.",
+          {"old_name": {"type": "string"}, "new_name": {"type": "string"},
+           "path": {"type": "string"}, "file_glob": {"type": "string"}},
+          ["old_name", "new_name"]),
+    _tool("delete_file", "Delete one file by exact path (no wildcards, not a directory). "
+                         "Backed up first.",
+          {"path": {"type": "string"}}, ["path"]),
+    _tool("move_file", "Move or rename one file; src and dst are both exact file paths. Refuses "
+                       "to overwrite an existing dst. Imports of a moved module are not updated.",
+          {"src": {"type": "string"}, "dst": {"type": "string"}}, ["src", "dst"]),
+    _tool("copy_file", "Copy one file to a new exact file path. Refuses to overwrite an existing dst.",
+          {"src": {"type": "string"}, "dst": {"type": "string"}}, ["src", "dst"]),
+    _tool("make_dir", "Create a directory, plus any missing parents, at an exact path.",
+          {"path": {"type": "string"}}, ["path"]),
+    _tool("diff_files", "Unified diff between two files, path_a as before, path_b as after.",
+          {"path_a": {"type": "string"}, "path_b": {"type": "string"},
+           "context_lines": {"type": "integer"}}, ["path_a", "path_b"]),
+    _tool("diff_with_backup", "Show what changed in a file since a backup. With only path: since "
+                              "its most recent backup, i.e. what the last edit to it changed. "
+                              "With backup: that backup from list(target='backups') against its "
+                              "file's current state.",
+          {"path": {"type": "string"}, "backup": {"type": "string"},
+           "context_lines": {"type": "integer"}}),
+    _tool("remove_dependency", "Remove a dependency from the project's dependency file.",
+          {"name": {"type": "string"}, "language": {"type": "string"}}, ["name"]),
+    _tool("update_dependency", "Change the version of a dependency already listed. '2.31.0' pins "
+                               "with ==, a full specifier like '>=2,<3' is used as-is, omit "
+                               "version to unpin.",
+          {"name": {"type": "string"}, "version": {"type": "string"},
+           "language": {"type": "string"}}, ["name"]),
     _tool("todo_read", "Read the current todo list as JSON.", {}),
     _tool("todo_write", "Overwrite the todo list. Each item: {id, task, status}.",
           {"items": {"type": "array", "items": {"type": "object"}}}, ["items"]),
@@ -1603,6 +2314,18 @@ DISPATCH = {
     "run_command": run_command,
     "todo_read": todo_read,
     "todo_write": todo_write,
+    "read_lines": read_lines,
+    "find_definition": find_definition,
+    "find_references_in_project": find_references_in_project,
+    "rename_symbol_in_project": rename_symbol_in_project,
+    "delete_file": delete_file,
+    "move_file": move_file,
+    "copy_file": copy_file,
+    "make_dir": make_dir,
+    "diff_files": diff_files,
+    "diff_with_backup": diff_with_backup,
+    "remove_dependency": remove_dependency,
+    "update_dependency": update_dependency,
 }
 
 # Name -> schema lookup, used to turn a wrong tool call into a usage hint
@@ -2415,5 +3138,3 @@ def run_agent(
         )
     finally:
         _ALLOWED_TOOLS = None
-
-
