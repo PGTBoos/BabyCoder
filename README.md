@@ -1,9 +1,10 @@
-
+![Alt text](../main/babycoder.png)  
+( *this is though all console-based* )
 
 # BabyCoder
 
-A small Python toolbox for running agents on small, local LLMs, and two very
-different agents built with it.
+A small Python toolbox for running agents on small, local LLMs.
+And two very different agents built with it.
 
 The idea behind all of it: small models are good at judgment in the moment
 and bad at holding things in mind. So Python holds the structure (the files,
@@ -27,8 +28,9 @@ thinks about what is on her mind, looks things up, and after a while she gets
 tired and sleeps. While she sleeps, she dreams about her memories, merges the
 ones that say the same thing, and sometimes wakes up wondering about
 something new. Her whole mind is a folder of markdown files you can open in
-any text editor.
-
+any text editor. You can see her looking up Wikipedia (tool use is yellow)
+Or see her dreaming in green, or see her thinking throughout her days.
+She has a novel idea of dreaming; it isn't mainly cleanup; it drives her thoughts.
 
 This is where most of my interest is these days. [Read more about Lisa.](/blob//main/docs/LISA.md)  
 It's is more akin to a research project for me.  
