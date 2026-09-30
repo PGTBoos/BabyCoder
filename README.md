@@ -1,4 +1,4 @@
-![Alt text](../main/babycoder.png)  
+![BabyCoder in the console](../main/babycoder.png)  
 ( *this is though all console-based* )
 
 # BabyCoder
