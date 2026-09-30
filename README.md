@@ -28,7 +28,7 @@ something new. Her whole mind is a folder of markdown files you can open in
 any text editor.
 
 This is where most of my interest is these days. [Read more about Lisa.](docs/LISA.md)  
-This is more akin to a research project for me.  
+It's is more akin to a research project for me.  
 
 ### [The coder - AST-based coding for small models](docs/CODER.md)
 
@@ -40,7 +40,7 @@ up, and a room runs the two in turn. Everything sandboxed per agent.
 While an agent can take multiple turns to solve something.
 More complex than the Lisa agent, though more targeted towards work.  
 
-[Read more about the coder.](docs/CODER.md)
+The coder is the most advanced agent for more info: [Read more about the coder.](docs/CODER.md)
 
 ## Quick start
 
