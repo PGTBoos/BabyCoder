@@ -21,31 +21,34 @@ Status: experimental, but both sides run end to end.
 
 ## The two sides of this project
 
-### [Lisa - an agent that lives on](../main/docs/Lisa.md)
+- ### [Lisa - an agent that lives on](../main/docs/Lisa.md)
 
-Lisa runs continuously. Talk to her, and she answers; leave her alone, and she
-thinks about what is on her mind, looks things up, and after a while she gets
-tired and sleeps. While she sleeps, she dreams about her memories, merges the
-ones that say the same thing, and sometimes wakes up wondering about
-something new. Her whole mind is a folder of markdown files you can open in
-any text editor. You can see her looking up Wikipedia (tool use is yellow)
-Or see her dreaming in green, or see her thinking throughout her days.
-She has a novel idea of dreaming; it isn't mainly cleanup; it drives her thoughts.
+  Lisa runs continuously. Talk to her, and she answers; leave her alone, and she
+  thinks about what is on her mind, looks things up, and after a while she gets
+  tired and sleeps. While she sleeps, she dreams about her memories, merges the
+  ones that say the same thing, and sometimes wakes up wondering about
+  something new. Her whole mind is a folder of markdown files you can open in
+  any text editor. You can see her looking up Wikipedia (tool use is yellow)
+  Or see her dreaming in green, or see her thinking throughout her days.
+  She has a novel idea of dreaming; it isn't mainly cleanup; it drives her thoughts.
 
-This is where most of my interest is these days. [Read more about Lisa.](../main/docs/Lisa.md)  
-It's is more akin to a research project for me.  
+  This is where most of my interest is these days. [Read more about Lisa.](../main/docs/Lisa.md)  
+  It's is more akin to a research project for me.  
 
-### [The coder - AST-based coding for small models](docs/CODER.md)
+- ### [The coder - AST-based coding for small models](../main/docs/Coder.md)
 
-Where this project started. Instead of asking a small model to hold a whole
-file in its head and write a diff, it edits code by symbol through Python
-tools: read one function, rewrite it, and Python checks the syntax before
-anything is saved. An architect agent plans work as todos, a coder picks them
-up, and a room runs the two in turn. Everything sandboxed per agent.
-While an agent can take multiple turns to solve something.
-More complex than the Lisa agent, though more targeted towards work.  
+  Where this project started. Instead of asking a small model to hold a whole
+  file in its head and write a diff, it edits code by symbol through Python
+  tools: read one function, rewrite it, and Python checks the syntax before
+  anything is saved. An architect agent plans work as todos, a coder picks them
+  up, and a room runs the two in turn. Everything is folder based sandboxed per agent.
+  (though its not a virtual environment, just basic safety here).
+  While an agent can take multiple turns to solve something.
+  More complex than the Lisa agent, though more targeted towards work.  
 
-The coder is the most advanced agent for more info: [Read more about the coder.](../main/docs/Coder.md)
+  The coder is the most advanced agent for more info: [Read more about the coder.](../main/docs/Coder.md)
+
+-----
 
 ## Quick start
 
