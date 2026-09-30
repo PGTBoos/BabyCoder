@@ -18,7 +18,7 @@ Status: experimental, but both sides run end to end.
 
 ## The two sides of this project
 
-### [Lisa - an agent that lives on](../main/docs/LISA.md)
+### [Lisa - an agent that lives on](../main/docs/Lisa.md)
 
 Lisa runs continuously. Talk to her, and she answers; leave her alone, and she
 thinks about what is on her mind, looks things up, and after a while she gets
