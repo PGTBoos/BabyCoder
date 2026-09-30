@@ -1,94 +1,86 @@
-> *AST-based (Abstract Syntax Tree) coding, with tool-based structured edits instead of raw diffs and context length limits.
-> Sandboxed by default; a (light weight) Sandboxed Multi-Agent Coding Toolkit.     
-> Python as a layer in between the agent and code access, also for automated feedback towards the agent.  
-> Written for smaller tool-calling LLMs, improving to keep them on track while writing code.   
-> Agents live in (light) folder-based isolation, though it's still your pc, keep that in mind.*  
->   
-> **Status: proof of concept, work in progress.**   
-> *It works, it's small, and there's an obvious next step that isn't built yet (see below).*  
+# BabyCoder
 
-## Why I built this
-Small, local LLMs can write code, but they lean hard on their own content/memory skills to do it.  
-And that's exactly where they're weakest.   
-Ask one to hold a whole file in mind while also writing correct code, and they start forgetting what it already wrote.  
-And they reintroduce bugs it just fixed, drift from the actual goal, or go into loops of thought.  
- 
-**The idea here:** stop asking it to remember the code at all. 
-Give a tool-calling LLM a way to operate on code through a Python add/remove/update chain instead,  
-so the file lives in Python, not in the model's limited context.   
-That frees it from needing the whole file in memory, and it opens the door to working through a to-do list.  
-One small task at a time instead of holding an entire plan in its head for the length of a long session.  
- 
-## What is it?
- 
-Instead of "here's a patch, apply it," the model calls tools, and Python code does the actual edit.
-Not the LLM trying to do so out of its small llm memory. A few of them:
- 
-- `list("symbols", "file.py")` - see what's in a file before touching it
-- `read_symbol("foo")` - pull just one function or class, not the whole file
-- `update_symbol("foo", new_code)` - rewrite it; syntax is checked first, bad edits are rejected
-- `find_references("foo")` - see every real usage before renaming or deleting it
-- `check_syntax("file.py")` - confirm the file still parses
-- `run_command("pytest")` - runs a shell command, but only after you type "y"
-- *...etc a lot more of such functions*
-In theory, it can rewrite one function in a huge codebase without the LLM ever needing the whole file in its context.
+A small Python toolbox for running agents on small, local LLMs, and two very
+different agents built with it.
 
-Right now there are two agents:
+The idea behind all of it: small models are good at judgment in the moment
+and bad at holding things in mind. So Python holds the structure (the files,
+the memory, the loop, the rules) and the model only makes the next decision.
+Python also talks back to the model: when a tool call is wrong, it says what
+went wrong and what was probably meant, which keeps a small model on track
+instead of derailing.
 
-- **Coder** - given a task, reads a function and rewrites it correctly.  
-  Runs end to end today: it takes an unfinished `shortest_path` function and implements it via the AST tools.   
-- **Architect** - a restricted, read-mostly agent that plans instead of codes, and leaves a todo for a coder to pick up later.  
-  It works, but it's not wired to the coder automatically yet - you run each by hand.  
+Written for models you can run at home (about 12 GB of VRAM or less), through
+LM Studio or any OpenAI-compatible server. No agent framework underneath:
+plain Python, readable start to finish.
 
-## What's different about it
+Status: experimental, but both sides run end to end.
 
-- Edits are **symbol-based, not diffs**. The tool understands "this is a function" and "is this still valid Python" - not just text matching.  
-- Every agent gets its **own sandboxed folder**, automatically. Two agents literally cannot reach each other's files, because nothing  
-  points a path-check at the other one's folder.  
-- Any shell command the model wants to run **needs a human "y" first**.
-- No AI framework underneath, just one Python file. Easy to read start to finish.
+## The two sides of this project
 
-### Why this might be interesting
+### [Lisa - an agent that lives on](docs/LISA.md)
 
-Most "AI coding agent" demos either give the model raw shell access or wrap it in a big framework. 
-This sits in between: small enough to read in one sitting, but with real guardrails (sandboxing, syntax checks, approval-gated commands, backups) 
-instead of "trust the model." to do all the coding.
-The python part can as well give 'standard' text replies towards the coder (the symbol x was not found, did you mean perhaps ...) etc.
-This is helpfull towards keeping smaller llm's on track without derailing of their goal.
+Lisa runs continuously. Talk to her, and she answers; leave her alone, and she
+thinks about what is on her mind, looks things up, and after a while she gets
+tired and sleeps. While she sleeps, she dreams about her memories, merges the
+ones that say the same thing, and sometimes wakes up wondering about
+something new. Her whole mind is a folder of markdown files you can open in
+any text editor.
 
-### Not there yet
+This is where most of my interest is these days. [Read more about Lisa.](docs/LISA.md)
+This is more akin to a research project for me.
 
-- The two agents don't talk to each other automatically - that's the next real milestone (not that hard from here).
-- Only Python is actually supported (other languages are stubbed).
-- No tests (my other project includes a test driven development work order, but not included here.
-- I am curious of what others think about, at this point this project i still can make big design choises about it.
-  Eventually it be some sort of auto coder, for cheaper to run models (12G Vram) or less.
+### [The coder - AST-based coding for small models](docs/CODER.md)
 
-  
+Where this project started. Instead of asking a small model to hold a whole
+file in its head and write a diff, it edits code by symbol through Python
+tools: read one function, rewrite it, and Python checks the syntax before
+anything is saved. An architect agent plans work as todos, a coder picks them
+up, and a room runs the two in turn. Everything sandboxed per agent.
+While an agent can take multiple turns to solve something.
+More complex than the Lisa agent, though more targeted towards work.
 
+[Read more about the coder.](docs/CODER.md)
 
-### Try it
+## Quick start
 
-```bash
-pip install requests
-# needs a local LM Studio instance running, or point it at another model
-python coder_agent.py
+    pip install requests
+    pip install ddgs              (optional: web search for Lisa)
 
-# later agent_room will be runner (also architect_agent can be run)
-# the idea is the room will follow some python based loop, inbetween agents.
-# agent toolkit contains all the commands and tricks, agents can get a set of allowed tools depending their role.
-```
+Start LM Studio with a model loaded, then:
 
-## Open question
+    python lisa_agent.py          talk to Lisa
+    python coder_agent.py         give the coder something to build
 
-Should the coder automatically pick up an architect's todos, or should
-that be a separate "orchestrator" script that runs both? Not sure yet.
-Opinions welcome. 
+Pointing it at another server or model needs no code changes:
 
-*I think to keep the coder working till execute, maybe add another command when it's ready then handover to architect for a next todo*
-*So agents can do multiple run's, but the switch towards another agent should happen only when (after multiple turns) agent A is ready*
-*some user intervention should though as well be possible*. 
-***Agent room** will be the place that will bind it together, though coder agent can run on its own for now.*
+    set BABYCODER_URL=http://localhost:1234/v1/chat/completions
+    set BABYCODER_MODEL=your-model-name
 
+(`export` instead of `set` on Linux and macOS.) It works with any
+tool-calling model; reasoning models are handled too (see the coder page).
 
+## What is in the repo
 
+| File | What it is |
+|---|---|
+| `babycoder/` | The toolkit: every tool, the agent loop, sandboxing, memory, the model layer. |
+| `lisa_agent.py` | Lisa. |
+| `coder_agent.py`, `architect_agent.py`, `agent_room.py` | The coding agents, and the room that runs them together. |
+| `designer_agent.py` | A small example: an agent made of nothing but a role and a set of granted tools. |
+| `emotion_agent.py` | An older experiment: a character whose emotions are kept in a tool schema. |
+| `LISA_DESIGN.md` | The design Lisa is written against. |
+| `tests/` | Offline checks, with a stand-in for the model server. No LM Studio needed. |
+
+Run the checks with:
+
+    python tests/check_babycoder.py
+
+## Feedback welcome
+
+This is a personal research project and I can still make big design choices.
+If you are working on something similar, persistent agents, memory that
+consolidates while idle, or coding with small models, I would like to hear
+from you. Open an issue or a discussion.
+
+MIT licensed.
