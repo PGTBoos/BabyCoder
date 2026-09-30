@@ -9,7 +9,7 @@ loop on top of them.
 Deliberately NOT how you might first picture "two agents talking": there
 is no ping-pong chat between them, and "who goes next" is not decided by
 asking a third LLM to read the room. It's decided by plain Python reading
-the shared todo list (todo_read/todo_write, already in agent_toolkit.py),
+the shared todo list (todo_read/todo_write, in the babycoder package),
 same file both agents already know how to use. That keeps the one thing
 that actually needs judgement (what to plan, what to write) on the LLM,
 and the one thing that doesn't (whose turn is it) off of it - an LLM
@@ -31,43 +31,20 @@ Run:
 """
 
 import json
+import sys
 
-from agent_toolkit import configure_workspace, run_agent, todo_read, todo_write, write_file
-from architect_agent import PERSONA as ARCHITECT_BASE_PERSONA, ALLOWED as ARCHITECT_ALLOWED
+from babycoder import AGENT_CODER, coding, planner, run_agent, using
+from agent_common import ensure_utf8_console, print_usage, read_task
+from architect_agent import (PERSONA as ARCHITECT_PERSONA, ALLOWED as ARCHITECT_ALLOWED,
+                             WORKSPACE as ARCHITECT_WORKSPACE)
+from coder_agent import PERSONA as CODER_PERSONA, DEMO_SEED, WORKSPACE as CODER_WORKSPACE
 
-# The coder has no reusable PERSONA constant to import - coder_agent.py's
-# __main__ block sends run_agent a one-off task string with no
-# persona_prompt at all, because that file is a fixed demo, not a role.
-# The room needs the coder to behave as a standing role instead (pick up
-# whatever's assigned to it, not one hardcoded task), so that role
-# description is written fresh here rather than pulled from a file that
-# doesn't define it.
-CODER_BASE_PERSONA = (
-    "You are the CODER agent in a multi-agent room. You do not plan; you "
-    "implement whatever todo items are assigned to you. Use read_symbol / "
-    "update_symbol / check_syntax and the rest of your tools as normal."
-)
-
-# Both roles read and write the same JSON list via todo_read/todo_write.
-# todo_write REPLACES the whole file, it does not merge - so this schema
-# note has to tell both personas to read the full list first, keep every
-# item they're not touching, and write the full list back. Skipping that
-# is the most likely way for one role to silently erase the other's
-# entries.
-TODO_SCHEMA_NOTE = (
-    "\n\nThe shared todo list (todo_read / todo_write) is a JSON array. "
-    "Every item must have exactly these fields:\n"
-    '  {"description": "...", "owner": "architect" | "coder", "status": "pending" | "done"}\n'
-    "todo_write REPLACES THE ENTIRE LIST. Always todo_read first, keep every "
-    "existing item you are not changing, and write the complete list back - "
-    "never just the item you added or changed.\n"
-    "When you finish implementing an item, set its status to \"done\" and "
-    "write the list back rather than deleting it, so the room can see it "
-    "was completed rather than never having existed."
-)
-
-ARCHITECT_PERSONA = ARCHITECT_BASE_PERSONA + TODO_SCHEMA_NOTE
-CODER_PERSONA = CODER_BASE_PERSONA + TODO_SCHEMA_NOTE
+# Both personas, and the todo schema note baked into them, now come from the
+# role files themselves rather than being restated here. The room used to
+# define the coder's role inline because coder_agent.py was a fixed demo with
+# no reusable role to import; now that the coder runs standalone it has one,
+# and a room that redefined it would just be a second copy free to drift from
+# the role the coder actually plays when run on its own.
 
 
 def _read_todos() -> list:
@@ -77,7 +54,7 @@ def _read_todos() -> list:
     schema - the room should keep going and let the next architect turn
     clean it up, not crash on it."""
     try:
-        items = json.loads(todo_read())
+        items = json.loads(planner.todo_read())
     except json.JSONDecodeError:
         return []
     return items if isinstance(items, list) else []
@@ -104,6 +81,14 @@ def decide_next(items: list) -> str:
     if _pending(items, "coder"):
         return "coder"
     if any(isinstance(t, dict) and t.get("status") != "done" for t in items):
+        return "architect"
+    if not any(isinstance(t, dict) for t in items):
+        # The board is non-empty but nothing on it is even shaped like an
+        # item - a smaller model wrote bare strings instead of objects, say.
+        # That is NOT done; without this the room congratulates itself and
+        # exits on a task nobody started. Hand it to the architect to
+        # rewrite, which is what _read_todos' docstring already promises.
+        # run_room's stale-round and max_rounds guards keep that bounded.
         return "architect"
     return None
 
@@ -140,26 +125,24 @@ def run_room(task: str, max_rounds: int = 6, interactive: bool = True) -> None:
         else:
             note = ""
 
-        state_before = todo_read()
+        state_before = planner.todo_read()
 
-        # Re-point the shared workspace/backup/transcript globals at this
-        # role's own folder right before its turn. Importing
-        # architect_agent above already called configure_workspace once,
-        # but whichever role ran last is whatever's active now - this
-        # call is what actually decides where THIS turn's tools land, not
-        # the import.
+        # Each role's turn runs in that role's own Workspace, handed to
+        # run_agent explicitly. Nothing is reconfigured between turns, so
+        # there is no "whichever role ran last" state to get wrong.
         if speaker == "architect":
-            configure_workspace("architect")
+            workspace = ARCHITECT_WORKSPACE
             prompt = (
                 f"Overall task: {task}\n\n"
                 "Check todo_read first. If nothing is planned yet, break the "
                 "task into a small number of clear, actionable todos owned by "
                 "\"coder\". If coder todos already exist and are all done, "
-                "either add any remaining follow-up work or, if the task is "
-                "genuinely complete, make no changes and say so."
+                "read the coder's work under @coder/ to check it, then either "
+                "add follow-up todos for what is missing or wrong, or, if the "
+                "task is genuinely complete, make no changes and say so."
             )
         else:
-            configure_workspace("sandbox")
+            workspace = CODER_WORKSPACE
             prompt = (
                 f"Overall task: {task}\n\n"
                 "Check todo_read first, find the pending todo item(s) with "
@@ -171,11 +154,12 @@ def run_room(task: str, max_rounds: int = 6, interactive: bool = True) -> None:
             prompt += f"\n\nNote from the person running this room: {note}"
 
         persona = ARCHITECT_PERSONA if speaker == "architect" else CODER_PERSONA
-        allowed = ARCHITECT_ALLOWED if speaker == "architect" else None
-        result = run_agent(prompt, persona_prompt=persona, allowed_tools=allowed)
+        allowed = ARCHITECT_ALLOWED if speaker == "architect" else AGENT_CODER
+        result = run_agent(prompt, persona_prompt=persona, allowed_tools=allowed,
+                           workspace=workspace)
         print(f"[ROOM] {speaker} finished: {result}")
 
-        if todo_read() == state_before:
+        if planner.todo_read() == state_before:
             stale_rounds += 1
             if stale_rounds >= 2:
                 print("[ROOM] two rounds in a row with no change to the todo "
@@ -189,30 +173,43 @@ def run_room(task: str, max_rounds: int = 6, interactive: bool = True) -> None:
           "stopping so a human can look.")
 
 
-if __name__ == "__main__":
-    # Same starting point coder_agent.py uses on its own, so this demo is
-    # directly comparable to running the coder standalone. Explicitly
-    # reset to the coder's sandbox first: importing architect_agent above
-    # already left the shared workspace pointed at sandbox_architect.
-    configure_workspace("sandbox")
-    write_file(
-        "graph_tools.py",
-        "def add_edge(graph, a, b):\n"
-        "    graph.setdefault(a, []).append(b)\n"
-        "    graph.setdefault(b, []).append(a)\n"
-        "    return graph\n"
-        "\n"
-        "\n"
-        "def shortest_path(graph, start, end):\n"
-        "    # TODO: not implemented yet.\n"
-        "    return None\n",
-    )
-    todo_write([])  # clear any todos left over from a previous run
+DEMO_TASK = (
+    "In graph_tools.py, implement shortest_path(graph, start, end) as a "
+    "real breadth-first search over `graph` (a dict mapping each node "
+    "to a list of neighbors, built by add_edge). It should return the "
+    "list of nodes on a shortest path from start to end, inclusive, or "
+    "None if no path exists."
+)
 
-    run_room(
-        "In graph_tools.py, implement shortest_path(graph, start, end) as a "
-        "real breadth-first search over `graph` (a dict mapping each node "
-        "to a list of neighbors, built by add_edge). It should return the "
-        "list of nodes on a shortest path from start to end, inclusive, or "
-        "None if no path exists."
+
+if __name__ == "__main__":
+    ensure_utf8_console()
+    task, mode = read_task(
+        prompt="What should the room work on? ",
+        demo_task=DEMO_TASK,
     )
+
+    if mode == "help":
+        print_usage("agent_room.py")
+        sys.exit(0)
+    if mode == "quit":
+        sys.exit(0)
+    if mode == "todos":
+        # A room with no overall task has nothing to hand the architect. The
+        # coder alone can work an existing board, so say that rather than
+        # spinning up two roles to discover there is nothing to plan.
+        print("The room needs an overall task to work on.\n")
+        print("To just work through todos that already exist, run:")
+        print("    python coder_agent.py --todos\n")
+        print_usage("agent_room.py")
+        sys.exit(0)
+
+    if mode == "demo":
+        # Only the demo seeds a starting file and wipes the board. A real task
+        # must not have a stray graph_tools.py dropped into the sandbox, and
+        # must not silently discard todos someone left there on purpose.
+        with using(CODER_WORKSPACE):
+            coding.write_file("graph_tools.py", DEMO_SEED)
+        planner.todo_write([])
+
+    run_room(task)

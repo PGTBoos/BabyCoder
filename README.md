@@ -27,7 +27,6 @@ ones that say the same thing, and sometimes wakes up wondering about
 something new. Her whole mind is a folder of markdown files you can open in
 any text editor.
 
-https://github.com/PGTBoos/BabyCoder/blob/main/doc/Lisa.md
 
 This is where most of my interest is these days. [Read more about Lisa.](/blob//main/docs/LISA.md)  
 It's is more akin to a research project for me.  
