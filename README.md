@@ -45,7 +45,7 @@ up, and a room runs the two in turn. Everything sandboxed per agent.
 While an agent can take multiple turns to solve something.
 More complex than the Lisa agent, though more targeted towards work.  
 
-The coder is the most advanced agent for more info: [Read more about the coder.](../main/docs/CODER.md)
+The coder is the most advanced agent for more info: [Read more about the coder.](../main/docs/Coder.md)
 
 ## Quick start
 
