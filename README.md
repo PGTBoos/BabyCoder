@@ -32,7 +32,7 @@ any text editor. You can see her looking up Wikipedia (tool use is yellow)
 Or see her dreaming in green, or see her thinking throughout her days.
 She has a novel idea of dreaming; it isn't mainly cleanup; it drives her thoughts.
 
-This is where most of my interest is these days. [Read more about Lisa.](/blob//main/docs/LISA.md)  
+This is where most of my interest is these days. [Read more about Lisa.](../main/docs/Lisa.md)  
 It's is more akin to a research project for me.  
 
 ### [The coder - AST-based coding for small models](docs/CODER.md)
@@ -45,7 +45,7 @@ up, and a room runs the two in turn. Everything sandboxed per agent.
 While an agent can take multiple turns to solve something.
 More complex than the Lisa agent, though more targeted towards work.  
 
-The coder is the most advanced agent for more info: [Read more about the coder.](docs/CODER.md)
+The coder is the most advanced agent for more info: [Read more about the coder.](../main/docs/CODER.md)
 
 ## Quick start
 
