@@ -7,11 +7,13 @@ A small Python toolbox for running agents on small, local LLMs.
 And two very different agents built with it.
 
 The idea behind all of it: small models are good at judgment in the moment
-and bad at holding things in mind. So Python holds the structure (the files,
-the memory, the loop, the rules) and the model only makes the next decision.
-Python also talks back to the model: when a tool call is wrong, it says what
-went wrong and what was probably meant, which keeps a small model on track
-instead of derailing.
+and bad at holding things in mind. So Python as a layer in between the user and LLM.
+It holds the structure (the files, the memory, the loop, the rules) 
+While the model only makes the next decision.
+Python also talks back to the model: when a tool call is wrong, it nudges the model
+what went wrong and what was probably meant, which keeps a small model on track
+instead of derailing. The LLM's tool calling is orchestrated by Python.
+Each tool has its own help, and there is even a document about how to solve problems (for Lisa).
 
 Written for models you can run at home (about 12 GB of VRAM or less), through
 LM Studio or any OpenAI-compatible server. No agent framework underneath:
