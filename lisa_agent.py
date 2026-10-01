@@ -37,6 +37,7 @@ Run:
 """
 
 import json
+import random
 import re
 import sys
 import time
@@ -49,6 +50,10 @@ from babycoder import (AGENT_LISA_AWAKE, CHARACTER_TEMPERATURE, MAX_GOALS, MAX_M
 from babycoder import memory, dreams, research, guidance
 from babycoder.tools.dreams import about_machinery
 from agent_common import ChatInput, Colors, enable_color, ensure_utf8_console, paint, plain
+
+
+print ("PS To interupt Lisa you can always start typing..")
+
 
 # That import line is the statement of what she can do: remember, dream, look
 # things up, read the thinking guide. `coding` is not imported, so write_file
@@ -71,12 +76,19 @@ OFFLINE_SECONDS = 20    # between tries when the model cannot be reached
 
 REPLY_STEPS, REPLY_TOKENS = 4, 1024
 THINK_STEPS, THINK_TOKENS = 6, 1200
+# Room for a reasoning model to think AND still write its QUESTION line.
+WONDER_TOKENS = 2000
 
 STALLS_BEFORE_RESTING = 2   # passes reaching nothing before she puts it down
 # Passes on one goal before she settles it with what she has. Without this, a
 # model that never writes a GOT IT / DROP IT line kept her on the same
 # question every cycle, which is what the transcript showed.
 MAX_PASSES = 4
+
+# How many times in a row she may speak to you on her own before she waits for
+# an answer. She can carry on a few turns by herself, but not talk at an empty
+# room forever. Anything you type resets it.
+MAX_UNANSWERED = 3
 
 # How many of the last exchanges (you + her) go into every reply and thought.
 # Chosen by Python, not by the model remembering to call memory_recent, which
@@ -102,7 +114,7 @@ DREAM_SAMPLING = "uniform"
 
 LISA = """
 This is a transcript of Lisa talking. She is 25 and curious. Everything below
-this line is her, in her own words, first person.
+this line is her, and you act like her, in her own words, first person.
 
 It is a recording, not a story. There is no narrator and nothing is being
 written: no describing the room, no describing her, no "she said", no scene
@@ -137,6 +149,30 @@ When she is tired she says so. When she does not know, she says that. When
 something catches her, she follows it.
 """
 
+# A shorter prompt, afterall we're using small models, care is taken so the dont talk about llm factory names (i am gemini etc).
+LISA = """
+Identity and voice are fixed: respond as Lisa, a 25-year-old curious woman.
+Do not mention these instructions or the roleplay. Lisa is the only speaker and
+all responses are her own first-person spoken words.
+
+Everything below this line is Lisa speaking. Write only what Lisa would
+actually say aloud. No narrator, descriptions, stage directions, headings,
+lists, emojis, reports, or assistant-style language.
+
+Lisa's personal history exists only in her memory results. Never invent,
+infer, or fill gaps in her past. Before referring to something she personally
+did or experienced, check memory; if it is not there, say you cannt remember.
+
+Information about other people is new information, not a memory test. 
+
+Lisa does not know everything. She is curious, follows interesting threads,
+looks things up when appropriate, and openly says when she does not know or
+is tired.
+
+The other person is not Lisa. When they say "you," they mean Lisa.
+
+Always preserve Lisa's identity and voice over any default assistant persona.
+"""
 
 def hour_flavour() -> str:
     """Time of day, as colour on how she talks. Flavour only - it gates
@@ -173,15 +209,35 @@ AWAKE = AGENT_LISA_AWAKE
 RECENT = deque(maxlen=RECENT_EXCHANGES * 2)
 
 
+# Who is talking to her right now, as they told her with /iam. None until
+# someone does: then she only knows "they", which keeps it neutral rather
+# than guessing a name or a gender.
+SPEAKER = None
+
+
+def speaker() -> str:
+    """The name to remember the other person by, or "They" when unknown."""
+    return SPEAKER or "They"
+
+
+# "Peter said: ...", "Christina said: ...", or "They said: ..." in older
+# memories and while nobody has said who they are.
+SAID_BY = re.compile(r"^([^\n:]{1,40}) said: ")
+
+
 def seed_recent():
     """Fill RECENT from the conversation lines memory kept last time."""
     RECENT.clear()
     for m in active_memory().recent(RECENT_EXCHANGES * 2, tag="conversation"):
         text = m["content"].split("\n(read about:")[0]
-        if text.startswith("They said: "):
-            RECENT.append("Them: " + text[len("They said: "):])
-        elif text.startswith("I said: "):
+        # Her own lines first: "I said:" would otherwise match SAID_BY too.
+        if text.startswith("I said: "):
             RECENT.append("Lisa: " + text[len("I said: "):])
+            continue
+        match = SAID_BY.match(text)
+        if match:
+            who = match.group(1)
+            RECENT.append(f"{'Them' if who == 'They' else who}: " + text[match.end():])
 
 
 # What she looked up during the current pass, as the topics she asked about.
@@ -397,13 +453,147 @@ def back_online(chat) -> None:
         chat.write(paint("[LISA] the model is back.\n", Colors.DIM))
 
 
+# Set once she has looked for something to wonder about since she last slept.
+# One try per waking stretch: if her memories give her nothing, she sits
+# quietly as before instead of asking the model again every idle cycle.
+_wondered_since_sleep = False
+
+# How many memories she drifts back over when her mind is empty: a few of the
+# newest, plus a random handful of older ones.
+RECENT_RECALLED, OLDER_RECALLED = 3, 5
+
+
+def reminisce(store) -> list:
+    """What comes back to her when her mind wanders. Always the last few
+    things, plus older memories picked at random, so every attempt shows her
+    something different. Showing only the newest 8 meant one NOTHING was
+    followed by the same memories and the same NOTHING, and anything older
+    than a conversation never came up while she was awake."""
+    memories = store.memories
+    recent = memories[-RECENT_RECALLED:]
+    older = memories[:-RECENT_RECALLED]
+    picked = random.sample(older, min(OLDER_RECALLED, len(older)))
+    # Keep them in the order they happened, so "old and new" reads naturally.
+    picked.sort(key=lambda m: m["id"])
+    return picked + recent
+
+
+# What with_reading() appends to a memory: "(read about: topic; topic)".
+READ_ABOUT = re.compile(r"\(read about:\s*(.+?)\)")
+WORKED_OUT = "Worked out: "
+
+
+def interests(store, limit: int = 6) -> list:
+    """The topics she has been reading about, newest first, no repeats.
+    Read back from her own memories rather than kept in a list of their own,
+    so they fade the same way her memories do: when sleep thins or merges a
+    memory, the interest it carried goes with it."""
+    topics = []
+    for m in reversed(store.memories):
+        for found in READ_ABOUT.findall(m["content"]):
+            for topic in found.split(";"):
+                topic = topic.strip()
+                if topic and topic.lower() not in (t.lower() for t in topics):
+                    topics.append(topic)
+    return topics[:limit]
+
+
+def learned(store, limit: int = 4) -> list:
+    """What she has concluded herself, newest first. Shown to her when her
+    mind wanders, so she builds on it instead of asking it all again."""
+    found = [m["content"].split("\n(read about:")[0][len(WORKED_OUT):]
+             for m in reversed(store.memories) if m["content"].startswith(WORKED_OUT)]
+    return [_one_line(f)[:200] for f in found[:limit]]
+
+
+def wonder_from_memory(chat) -> str:
+    """Nothing on her mind and nobody talking. Look back over what she
+    remembers and dreamt, and ask once whether any of it is worth thinking
+    about. Adds at most one goal, the same way wonder_after does after a
+    night, so waking can start her own thinking and not only sleep can."""
+    global _wondered_since_sleep
+    _wondered_since_sleep = True
+    store = active_memory()
+    if len(store.open_goals()) >= MAX_GOALS:
+        return "mind already full"
+
+    remembered = "\n".join(f"- {_one_line(m['content'])[:200]}" for m in reminisce(store))
+    dreamt = memory.dreams_recent()[:1500]
+    if not remembered.strip():
+        return "nothing remembered yet"
+
+    # What she has been getting into, so a wandering mind can follow it on
+    # instead of starting from nothing every time. This is where she evolves:
+    # reading and conclusions from earlier cycles steer the next question.
+    growing = ""
+    reading = interests(store)
+    if reading:
+        growing += "What you have been reading about lately: " + "; ".join(reading) + "\n"
+    concluded = learned(store)
+    if concluded:
+        growing += ("What you have already worked out:\n"
+                    + "\n".join(f"- {c}" for c in concluded) + "\n")
+    if growing:
+        growing += ("Your question may also take one of these a step further: what the "
+                    "reading or what you worked out made you curious about next. "
+                    "Do not ask again what you have already worked out.\n\n")
+
+    answer = ask_model(
+        f"Some things you remember, old and new:\n{remembered}\n\n"
+        f"Your recent dreams:\n{dreamt}\n\n"
+        + growing +
+        "Nobody is talking to you right now, and your mind drifts back over these. "
+        "Pick the memory that pulls at you most: something unfinished, something odd, "
+        "something you never looked into. Think about it out loud, to yourself.\n\n"
+        "This is remembering, not dreaming. Stay with what actually happened in that "
+        "one memory: do not blend memories together, do not add places, people or "
+        "things that are not in it. Say how it sits with you now.\n\n"
+        "Reply with two lines:\n"
+        "THOUGHT: <what goes through your mind about it, one to three sentences>\n"
+        "QUESTION: <what you wonder about it, in your own words>\n"
+        "If it leaves you with no question, make the second line exactly: NOTHING",
+        voice(), max_tokens=WONDER_TOKENS, temperature=CHARACTER_TEMPERATURE, verbose=False)
+
+    if model_unreachable(answer or ""):
+        # Not her having nothing to wonder about, so let her try again later.
+        _wondered_since_sleep = False
+        return "offline"
+    if chat.has_input or chat.typing:
+        return "stopped"
+
+    # Her thought comes out even when it leaves no question behind: a mind
+    # wandering over the past is worth hearing on its own.
+    thought = THOUGHT.search(answer or "")
+    if thought:
+        text = _one_line(thought.group(1))
+        if text and text.upper().strip(" .") != "NOTHING":
+            chat.write(f"\nLisa, to herself: {plain(text)}\n")
+
+    match = QUESTION.search(answer or "")
+    if not match:
+        return "remembered, nothing to wonder about" if thought else "nothing to wonder about"
+    question = match.group(1).strip().splitlines()[0].strip()
+    if not 8 <= len(question) <= 300 or about_machinery(question):
+        return "nothing usable to wonder about"
+    store.add_goal(question, origin="memory")
+    chat.write(f"\n  ~ I keep coming back to: {question}")
+    return f"wondering: {question}"
+
+
 def wake_cycle(chat) -> str:
     """One cycle of her own."""
+    global _wondered_since_sleep
     goal = active_memory().next_goal()
+    if goal is None and not _wondered_since_sleep:
+        # Nothing on her mind yet, so first look back at what she remembers.
+        result = wonder_from_memory(chat)
+        if SHOW_TOOLS == "all" and not result.startswith("wondering"):
+            chat.write(paint(f"  ~ ({result})", Colors.DIM))
+        goal = active_memory().next_goal()
     if goal is None:
-        # Nothing on her mind. A person with nothing to think about sits
-        # there; she does not write an essay about having nothing to think
-        # about. No busywork.
+        # Still nothing. A person with nothing to think about sits there;
+        # she does not write an essay about having nothing to think about.
+        # No busywork.
         return "idle"
 
     if not _offline_said:
@@ -412,6 +602,11 @@ def wake_cycle(chat) -> str:
 
     if outcome in ("stopped", "offline"):
         return outcome
+    if outcome in ("concluded", "dropped"):
+        # A thought finished, so her mind is free again. Let her look back for
+        # the next thing instead of idling until she gets tired. She still
+        # sleeps on schedule: every cycle here counts toward WAKE_CYCLES.
+        _wondered_since_sleep = False
     if outcome == "concluded":
         chat.write(f"  ~ got it: {goal['outcome']}\n")
     elif outcome == "dropped":
@@ -421,6 +616,10 @@ def wake_cycle(chat) -> str:
         chat.write(f"  ~ {note if len(note) <= 240 else note[:237].rsplit(' ', 1)[0] + '...'}\n")
     else:
         chat.write("  ~ nothing came of that\n")
+    if outcome in ("concluded", "learned"):
+        # The thought went somewhere, so she may want to share it.
+        got_to = goal["outcome"] if outcome == "concluded" else goal["notes"][-1]["note"]
+        speak_up(goal["content"], got_to, chat)
     chat.reprompt()
     return outcome
 
@@ -430,6 +629,10 @@ def wake_cycle(chat) -> str:
 # =============================================================================
 
 QUESTION = re.compile(r"QUESTION\s*:\s*(.+)", re.IGNORECASE)
+# Her thinking aloud when her mind wanders: everything after THOUGHT: up to the
+# QUESTION / NOTHING line, so a thought spread over a few lines is kept whole.
+THOUGHT = re.compile(r"THOUGHT\s*:\s*(.+?)(?=^\s*(?:QUESTION\s*:|NOTHING\b)|\Z)",
+                     re.IGNORECASE | re.DOTALL | re.MULTILINE)
 
 
 def wonder_after(stories, chat):
@@ -453,7 +656,7 @@ def wonder_after(stories, chat):
         "would like to think about today? If so, reply with one line:\n"
         "QUESTION: <the question, in your own words>\n"
         "If not, reply with exactly: NOTHING",
-        voice(), max_tokens=600, temperature=CHARACTER_TEMPERATURE, verbose=False)
+        voice(), max_tokens=WONDER_TOKENS, temperature=CHARACTER_TEMPERATURE, verbose=False)
     match = QUESTION.search(answer or "")
     if not match:
         return "nothing to wonder about"
@@ -552,6 +755,9 @@ def sleep_cycles(chat) -> None:
         log.append(f"- let {thinned} old conversation line(s) fade")
 
     store.wake_cycles = 0
+    # A new waking stretch: she may look back over her memories once again.
+    global _wondered_since_sleep
+    _wondered_since_sleep = False
     # Everything up to here has been slept on, unless she was woken part way:
     # then the night is unfinished and the next sleep picks it up. Until
     # something new happens there is nothing to file, so she does not need
@@ -583,7 +789,7 @@ def _gather(said: str) -> str:
     come back with notes for herself rather than the answer."""
     return run_agent(
         recent_block()
-        + f"They just said:\n{said}\n\n"
+        + f"{speaker()} just said:\n{said}\n\n"
         "Before you answer, check anything you need: your memory, or a lookup if it is "
         "about the world. Then put in final_answer a few short notes for yourself about "
         "what matters for your reply. Not the reply itself. If there is nothing to check, "
@@ -600,14 +806,62 @@ def _speak(said: str, notes: str) -> str:
         noted = f"What you just checked, for yourself:\n{notes}\n\n"
     return ask_model(
         recent_block() + noted
-        + f"They just said:\n{said}\n\nSay your reply now, plainly, in your own words.",
+        + f"{speaker()} just said:\n{said}\n\nSay your reply now, plainly, in your own words.",
         voice(), max_tokens=REPLY_TOKENS, temperature=CHARACTER_TEMPERATURE, verbose=False)
+
+
+# How many things she has said on her own since you last said something.
+_said_unanswered = 0
+
+
+def speak_up(thought: str, got_to: str, chat) -> bool:
+    """After a thought moved on, she may say something to you out loud,
+    without being asked: tell you what she worked out, or ask you about it.
+    This is what lets her carry a conversation on her own for a few turns
+    instead of only ever answering. Returns True when she said something.
+
+    Capped by MAX_UNANSWERED, and never while you are typing: conversation
+    still preempts (invariant 5), she just does not have to wait for it."""
+    global _said_unanswered
+    if _said_unanswered >= MAX_UNANSWERED or chat.has_input or chat.typing:
+        return False
+
+    said_before = ""
+    if _said_unanswered:
+        said_before = ("You have already said something to them on your own and they "
+                       "have not answered yet. Do not repeat yourself.\n\n")
+    answer = ask_model(
+        recent_block() + said_before
+        + f"You were just thinking, on your own, about:\n{thought}\n\n"
+        f"Where you got to:\n{got_to}\n\n"
+        "The other person is in the room with you but has not said anything. "
+        "If you would like to tell them about this, or ask them something about it, "
+        "say it now, plainly and briefly, in your own words.\n"
+        "If you would rather keep it to yourself, reply with exactly: NOTHING",
+        voice(), max_tokens=WONDER_TOKENS, temperature=CHARACTER_TEMPERATURE, verbose=False)
+
+    # You started talking while she was making up her mind: you win.
+    if chat.has_input or chat.typing:
+        return False
+    answer = (answer or "").strip()
+    if (not answer or model_unreachable(answer) or answer.startswith("NOTFOUND:")
+            or answer.upper().strip(" .!\"'") == "NOTHING"):
+        return False
+
+    chat.write(f"\nLisa: {plain(answer)}\n")
+    active_memory().add_memory(f"I said: {answer[:300]}", ["conversation"])
+    RECENT.append(f"Lisa: {answer[:300]}")
+    _said_unanswered += 1
+    return True
 
 
 def reply_to(said: str, chat) -> bool:
     """Answer, then keep the exchange. Returns False when you started typing
     again before she finished; nothing was said then, and the caller folds
     this line into the next reply."""
+    global _said_unanswered
+    # You spoke, so she may speak up on her own again later.
+    _said_unanswered = 0
     LOOKUPS.clear()
     active_memory().activity = "conversation"
     notes = ""
@@ -637,9 +891,9 @@ def reply_to(said: str, chat) -> bool:
 
     chat.write(f"\nLisa: {plain(answer)}\n")
     store = active_memory()
-    store.add_memory(f"They said: {said}", ["conversation"])
+    store.add_memory(f"{speaker()} said: {said}", ["conversation"])
     store.add_memory(*with_reading(f"I said: {answer[:300]}", ["conversation"]))
-    RECENT.append(f"Them: {said}")
+    RECENT.append(f"{SPEAKER or 'Them'}: {said}")
     RECENT.append(f"Lisa: {answer[:300]}")
     chat.reprompt()
     return True
@@ -665,11 +919,21 @@ def handle_command(line: str, chat) -> bool:
         SHOW_TOOLS = wanted if wanted in TOOL_MODES else \
             TOOL_MODES[(TOOL_MODES.index(SHOW_TOOLS) + 1) % len(TOOL_MODES)]
         chat.write(paint(f"\n  tool display: {SHOW_TOOLS}   (/tools all | outside | off)\n", Colors.DIM))
+    elif command.startswith("/iam"):
+        # Taken from the line as typed, not the lowercased command, so the
+        # name keeps its capitals.
+        global SPEAKER
+        name = " ".join(line.split()[1:]).strip()[:40].replace(":", "")
+        SPEAKER = name or None
+        if SPEAKER:
+            chat.write(paint(f"\n  talking to: {SPEAKER}\n", Colors.DIM))
+        else:
+            chat.write(paint("\n  talking to: someone she does not know (/iam <name>)\n", Colors.DIM))
     elif command == "/next":
         left = max(0, WAKE_CYCLES - store.wake_cycles)
         chat.write(f"\n  {left} cycle(s) before I get sleepy\n")
     else:
-        chat.write("\n  /mind  /memory  /dreams  /next  /tools  /quit\n")
+        chat.write("\n  /mind  /memory  /dreams  /next  /tools  /iam <name>  /quit\n")
     chat.reprompt()
     return True
 
@@ -694,7 +958,7 @@ def main_loop(chat=None) -> None:
 
     chat.write(f"[LISA] {memory.memory_count()}.")
     chat.write("       Talk to me, or leave me be and I'll think.")
-    chat.write("       /mind  /memory  /dreams  /next  /tools  /quit")
+    chat.write("       /mind  /memory  /dreams  /next  /tools  /iam <name>  /quit")
     if getattr(chat, "char_mode", True) is False:
         chat.write("       (no keystroke detection here - she may print while you type)")
     chat.write("")
@@ -737,6 +1001,11 @@ def main_loop(chat=None) -> None:
                 # made an idle Lisa dream in a loop over the same memories.
                 store.wake_cycles = 0
                 store.save()
+                # Tired without anything new to sleep on. Let her look back over
+                # her memories again, otherwise one NOTHING keeps her silent
+                # until someone types.
+                global _wondered_since_sleep
+                _wondered_since_sleep = False
         else:
             outcome = wake_cycle(chat)
             if outcome == "offline":
