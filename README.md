@@ -1,14 +1,19 @@
+![BabyCoder in the console](../main/babycoder.png)  
+( *this is though all console-based* )
+
 # BabyCoder
 
-A small Python toolbox for running agents on small, local LLMs, and two very
-different agents built with it.
+A small Python toolbox for running agents on small, local LLMs.
+And two very different agents built with it.
 
 The idea behind all of it: small models are good at judgment in the moment
-and bad at holding things in mind. So Python holds the structure (the files,
-the memory, the loop, the rules) and the model only makes the next decision.
-Python also talks back to the model: when a tool call is wrong, it says what
-went wrong and what was probably meant, which keeps a small model on track
-instead of derailing.
+and bad at holding things in mind. So Python as a layer in between the user and LLM.
+It holds the structure (the files, the memory, the loop, the rules) 
+While the model only makes the next decision.
+Python also talks back to the model: when a tool call is wrong, it nudges the model
+what went wrong and what was probably meant, which keeps a small model on track
+instead of derailing. The LLM's tool calling is orchestrated by Python.
+Each tool has its own help, and there is even a document about how to solve problems (for Lisa).
 
 Written for models you can run at home (about 12 GB of VRAM or less), through
 LM Studio or any OpenAI-compatible server. No agent framework underneath:
@@ -18,30 +23,34 @@ Status: experimental, but both sides run end to end.
 
 ## The two sides of this project
 
-### [Lisa - an agent that lives on](../main/docs/Lisa.md)
+- ### [Lisa - an agent that lives on](../main/docs/Lisa.md)
 
-Lisa runs continuously. Talk to her, and she answers; leave her alone, and she
-thinks about what is on her mind, looks things up, and after a while she gets
-tired and sleeps. While she sleeps, she dreams about her memories, merges the
-ones that say the same thing, and sometimes wakes up wondering about
-something new. Her whole mind is a folder of markdown files you can open in
-any text editor.
+  Lisa runs continuously. Talk to her, and she answers; leave her alone, and she
+  thinks about what is on her mind, looks things up, and after a while she gets
+  tired and sleeps. While she sleeps, she dreams about her memories, merges the
+  ones that say the same thing, and sometimes wakes up wondering about
+  something new. Her whole mind is a folder of markdown files you can open in
+  any text editor. You can see her looking up Wikipedia (tool use is yellow)
+  Or see her dreaming in green, or see her thinking throughout her days.
+  She has a novel idea of dreaming; it isn't mainly cleanup; it drives her thoughts.
 
+  This is where most of my interest is these days. [Read more about Lisa.](../main/docs/Lisa.md)  
+  It's is more akin to a research project for me.  
 
-This is where most of my interest is these days. [Read more about Lisa.](/blob//main/docs/LISA.md)  
-It's is more akin to a research project for me.  
+- ### [The coder - AST-based coding for small models](../main/docs/Coder.md)
 
-### [The coder - AST-based coding for small models](docs/CODER.md)
+  Where this project started. Instead of asking a small model to hold a whole
+  file in its head and write a diff, it edits code by symbol through Python
+  tools: read one function, rewrite it, and Python checks the syntax before
+  anything is saved. An architect agent plans work as todos, a coder picks them
+  up, and a room runs the two in turn. Everything is folder based sandboxed per agent.
+  (though its not a virtual environment, just basic safety here).
+  While an agent can take multiple turns to solve something.
+  More complex than the Lisa agent, though more targeted towards work.  
 
-Where this project started. Instead of asking a small model to hold a whole
-file in its head and write a diff, it edits code by symbol through Python
-tools: read one function, rewrite it, and Python checks the syntax before
-anything is saved. An architect agent plans work as todos, a coder picks them
-up, and a room runs the two in turn. Everything sandboxed per agent.
-While an agent can take multiple turns to solve something.
-More complex than the Lisa agent, though more targeted towards work.  
+  The coder is the most advanced agent for more info: [Read more about the coder.](../main/docs/Coder.md)
 
-The coder is the most advanced agent for more info: [Read more about the coder.](docs/CODER.md)
+-----
 
 ## Quick start
 
