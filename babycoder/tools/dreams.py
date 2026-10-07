@@ -35,6 +35,56 @@ def about_machinery(text):
     return bool(MACHINERY.search(text or ""))
 
 
+# Questions about whether her own past is real. These are not goals, for a
+# stronger reason than the method questions above: a method question is merely
+# unproductive, while this kind CANNOT be closed. The premise she is given is
+# that her memory is incomplete and that not remembering proves nothing - so
+# no memory tool, no lookup and nobody in the room can ever settle it.
+#
+# Left to become goals they could only stall out or be force-closed by
+# MAX_PASSES, and meanwhile each pass filed another doubt that the next round
+# of wandering found and doubted again. That loop is what had her looking up
+# whether something was wrong with her mind: not a mood, a question generator
+# emitting questions built to fail.
+#
+# Her own past being settled is what makes her a person with a life rather
+# than an investigation into one. What other people did, what she read, what
+# she is curious about in the world - all still fair game.
+UNANSWERABLE = re.compile(
+    r"\b(?:"
+    # did it really happen / was it real
+    r"(?:did|do|does|is|are|was|were|has|have|can|could|should|would|am)\b[^.?!]{0,60}"
+    r"\b(?:real|really (?:happen|exist|meet|met|say|said|do|did|know)|actually (?:happen|exist|meet|met)|"
+    r"make (?:it|that|them) up|made (?:it|that|them) up|imagin\w+|invent\w+|fabricat\w+)"
+    r"|(?:my|her) (?:own )?(?:memor\w+|past|childhood|mind|head|life story|identity)\b[^.?!]{0,40}"
+    r"\b(?:real|reliable|trust\w*|accurate|true|wrong|broken|failing|incomplete|missing|gaps?)"
+    r"|(?:something|anything) wrong with (?:my|her) (?:mind|memory|head|brain)"
+    r"|(?:am|is) (?:i|she) (?:really |actually |just )?"
+    r"(?:mis)?(?:remember\w*|confus\w+|los\w+ (?:it|my mind|her mind)|forget\w*|making it up)"
+    # "Did I really work at the Gilded Page?" - the doubt is carried entirely
+    # by really/actually/ever next to a first-person past tense, and no list of
+    # verbs will cover it ("work", "live", "play", "own", "study"...). The
+    # adverb is what makes it a question about whether her past is true rather
+    # than a question about the past.
+    r"|(?:did|do|does|was|were|am|is|have|has|had|could|would) (?:i|she) "
+    r"(?:really|actually|ever|truly|genuinely)\b"
+    r"|false memor\w+|confabulat\w+|gaslight\w+"
+    r"|who (?:am i|is she) (?:really|actually)"
+    r"|(?:do|did) (?:i|she) (?:really |actually )?(?:exist|live|experience)"
+    r")\b",
+    re.IGNORECASE)
+
+
+def unanswerable_about_self(text):
+    """True when a question asks whether her own past or mind is real.
+
+    Deliberately about HER past, not about the past in general: "did the
+    Gilded Page close down" is a real question with a real answer, while "did
+    I really work at the Gilded Page" is not one she can ever settle.
+    """
+    return bool(UNANSWERABLE.search(text or ""))
+
+
 # How a dream picks its memories.
 #   "uniform"  every memory equally likely. The baseline.
 #   "residue"  weighted the way human dreams seem to be: mostly the last day
@@ -129,7 +179,10 @@ def tidy_memories(system_prompt="", sample=6):
     if mem.count() < 3:
         return "too little to tidy"
     anchor = mem.random(1)[0]
-    others = mem.random(sample, exclude=[anchor["id"]])
+    # Related to the anchor, not picked at random beside it. See Memory.like:
+    # a random handful almost never contains a same-subject pair, so almost
+    # nothing ever merged and her memories only grew.
+    others = mem.like(anchor, sample)
     listing = "\n".join(f"[{m['id']}] {m['content'][:150]}" for m in [anchor] + others)
 
     verdict = ask_model(

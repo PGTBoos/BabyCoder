@@ -96,11 +96,13 @@ memory = Toolset(
     "memory", "Long-term memory and what is on your mind.",
     _m.memory_count, _m.memory_at, _m.memory_recent, _m.memory_oldest, _m.memory_random,
     _m.memory_find, _m.remember, _m.consolidate, _m.goals_list, _m.goal_add, _m.goal_close,
-    _m.dreams_recent,
+    _m.dreams_recent, _m.about_person,
     usage="Look before you answer something you may already have been told. Reach for "
           "memory_oldest and memory_random as well as recent. Keep what you would want to know "
           "next time, not what you can work out again. Put something on your mind with goal_add, "
-          "and let it go with goal_close once it is answered or stops mattering.")
+          "and let it go with goal_close once it is answered or stops mattering. about_person is "
+          "for people you have talked to: what they have told you about themselves, which no "
+          "lookup anywhere could have told you.")
 
 dreams = Toolset(
     "dreams", "Dreaming and tidying memory.",

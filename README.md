@@ -94,3 +94,28 @@ consolidates while idle, or coding with small models, I would like to hear
 from you. Open an issue or a discussion.
 
 MIT licensed.
+
+## Putting a thought in her head
+
+Two commands write straight into her stores, decorated so that what she reads
+back is identical to something she produced herself:
+
+    /goal Why do gulls follow tractors across a field?
+    /mem  I watched a heron at the Vooroever this morning #thinking
+
+You type plain text; the number, timestamp and tags are generated the way her
+own entries are. She has no way to tell. The one field that records where it
+came from, `origin: injected` in `goals.md`, never reaches the model - it is
+there for you when you read a transcript back.
+
+An injected goal is backdated so she takes it on her next cycle rather than
+last. `next_goal()` picks the goal left alone longest, so without that a fresh
+injection would be the last one she would choose - with a full mind, seven
+cycles away, which is no use for breaking a loop you are watching now.
+
+A goal her own filters would refuse (anything about whether her past is real)
+is still accepted, because you are the operator, but the console says it may
+loop.
+
+This is a development instrument, not part of who she is. Watching a loop does
+not tell you what would break it. `/injectgoal` and `/injectmem` work too.
