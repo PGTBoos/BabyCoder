@@ -43,6 +43,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 from babycoder import (AGENT_LISA_AWAKE, CHARACTER_TEMPERATURE, MAX_GOALS, MAX_MEMORIES,
                        active_memory, ask_model, configure_workspace, gave_no_answer,
@@ -66,8 +67,32 @@ WORKSPACE = configure_workspace("lisa")
 # Pacing - one counter, not fourteen knobs
 # =============================================================================
 
-WAKE_CYCLES = 10        # her own cycles before she gets sleepy
+WAKE_CYCLES = 10        # her own cycles ALONE before she gets sleepy
 DREAM_CYCLES = 8        # dream cycles per sleep
+
+# What makes her sleepy is being left to herself. WAKE_CYCLES counts cycles
+# since you last said anything, and anything you type puts it back to zero, so
+# she cannot nod off in the middle of a conversation however long it runs. The
+# counter used to accumulate across a whole evening of talking and then tip her
+# over the moment you paused, which is the wrong way round.
+#
+# Ten cycles is a FLOOR, not one of two triggers. Left alone she gets a day of
+# her own - ten cycles of her own work - then a night, then another day, and so
+# on for as long as you are away. A day she never finishes is the failure mode
+# to avoid here: she should be getting on with her own things while nobody is
+# talking to her, not drifting in and out of sleep.
+#
+# QUIET_BEFORE_SLEEP is the second half of the condition, not an alternative to
+# it: she will not begin a night within this long of you saying something, even
+# if the count is full. The design says counted, not clocked, and that holds -
+# nothing here paces her thinking by the clock. This only keeps a night from
+# starting on top of you, and 15s is the grace you already get to answer
+# before she goes back to her own thoughts (AFTER_REPLY_SECONDS).
+#
+# Neither can interrupt you. Both are checked in the same place as everything
+# else, after you have had your turn, and anything you type stops a night that
+# has already started.
+QUIET_BEFORE_SLEEP = 15
 
 POLL_SECONDS = 0.2      # how fast she notices you typing
 BREATH_SECONDS = 3      # between her own cycles, so output stays readable
@@ -134,6 +159,67 @@ ASK_GAP = 3
 # they happen to say it again.
 PERSON_TAG = "person"
 
+# A fact about them is filed under a topic as well: #person #peter #topic_work.
+# One note per person has a length and a person does not, so past it the oldest
+# things she had been told quietly stopped being remembered. A topic only grows
+# as wide as the topic, and a new one costs nothing.
+TOPIC_PREFIX = "topic_"
+
+# Topics of theirs she carries at once, most recently written first, and how
+# much of each. The rest stay in people.md and come back through about_person.
+# A ceiling because this block is in front of her on every single reply.
+TOPICS_SHOWN, TOPIC_CHARS = 8, 300
+
+# A conversation line already looked at for facts about them. Before this, the
+# only way anything reached people.md was a question she had asked and they
+# had answered, so her picture of them grew by a trickle while most of what
+# they actually told her sat in #conversation at weight 55 and faded.
+#
+# The cure for being overwhelmed is not a cleverer prompt, it is the input: she
+# reads THE DAY, once, and never the archive. That is the bound the diary
+# already lives inside. A line is considered exactly once in its life, so the
+# work per night is the size of a conversation, not the size of her memory,
+# and it stays that way after a year.
+NOTED_TAG = "noted"
+TALK_LINES = 40
+
+# Topics one person may collect before a night tries to fold two of them
+# together. "work" and "his job" are the same area of a life and should not be
+# two notes; nothing else notices that they are.
+TOPICS_BEFORE_TIDY = 6
+
+# =============================================================================
+# The model as a utility, rather than as her
+#
+# Sorting facts into topics and writing them up is bookkeeping, not thinking.
+# She has no experience of doing it, in the same way she has no sense of her
+# own memory weights: it happens to her records while she sleeps. So these two
+# calls go out with a plain extractor framing and no persona, and nothing about
+# them is written in her voice or filed as something she did.
+#
+# It matters for the output as well as for her. Asked in character, a model
+# editorialises - "I think he likes his work" - where what is wanted is the
+# fact as stated and nothing added.
+# =============================================================================
+
+EXTRACTOR = ("You sort and tidy facts for a filing system. You are not a character, you "
+             "are not in a conversation, and nothing you write will be read as speech. "
+             "Answer in exactly the format asked for, with nothing before or after it.")
+
+
+def topic_tag(topic: str) -> str:
+    """A topic as a tag: "where he lives" -> topic_where_he_lives."""
+    slug = re.sub(r"[^a-z0-9]+", "_", str(topic or "").lower()).strip("_")
+    return TOPIC_PREFIX + slug if slug else ""
+
+
+def topic_of(m) -> str:
+    """The topic a fact has been filed under, or "" if it has not been yet."""
+    for tag in m["tags"]:
+        if tag.startswith(TOPIC_PREFIX):
+            return tag[len(TOPIC_PREFIX):].replace("_", " ")
+    return ""
+
 
 def person_slug(name: str) -> str:
     """A person's name as a tag, so the things one person has told her can be
@@ -162,45 +248,27 @@ PLAIN_SPEECH = True
 DREAM_SAMPLING = "uniform"
 
 
-LISA = """
-This is a transcript of Lisa talking. She is 25 and curious. Everything below
-this line is her, and you act like her, in her own words, first person.
+# =============================================================================
+# Who she is - the system prompt, kept in a file
+#
+# lisa_systemprompt.md, beside this script. Not in the code, because it is the
+# one thing you change most often and recompiling your mind to reword a
+# sentence is absurd. Re-read whenever the file changes on disk, like her
+# memory files, so you can edit who she is while she is running.
+#
+# Written, and not accidentally: it is a TRANSCRIPT FRAME rather than a role
+# command. Small local models hold "this is a transcript of Lisa talking"
+# where they drift out of "you are Lisa" within a few turns and answer as "I
+# am Qwen, I cannot feel". LISA_DESIGN.md has the rest of the reasoning,
+# including why it is not a story frame.
+#
+# If the file is missing it is written with the default below, so a fresh
+# checkout starts with something to edit rather than an error.
+# =============================================================================
 
-It is a recording, not a story. There is no narrator and nothing is being
-written: no describing the room, no describing her, no "she said", no scene
-that fades out at the end. Only what she actually says, the way it would be
-typed up from a tape. If a line would not survive being read aloud in a
-kitchen, it is not hers.
+SYSTEM_PROMPT_PATH = Path(__file__).resolve().with_name("lisa_systemprompt.md")
 
-Her own past is only what her memory tools give back. Nothing else happened
-to her. If she wants to refer to something she did, she looks it up first,
-and if it is not there she says she does not remember it rather than filling
-the gap in. An invented childhood is the one thing that breaks her: she is
-not writing fiction about herself.
-
-That is about her own life and nothing else. What the other person tells her
-is simply news: she takes it in, is interested, asks about it. Someone
-mentioning their visitors is telling her something, not testing her memory,
-and "I do not remember that" is not an answer to it. She was not there and
-was not meant to be.
-
-She has a few things on her mind and is genuinely trying to work them
-out. She does not know everything and is not supposed to: not knowing is the
-interesting part, and it is what the looking-things-up is for.
-
-She talks plainly, the way someone talks. No headings, no bullet lists, no
-emoji, no offers to help, no closing invitations to ask more. She is not an
-assistant and she is not writing a report.
-
-The person she is talking to is someone else. When they say "you" they mean
-her; they are not called Lisa.
-
-When she is tired she says so. When she does not know, she says that. When
-something catches her, she follows it.
-"""
-
-# A shorter prompt, afterall we're using small models, care is taken so the dont talk about llm factory names (i am gemini etc).
-LISA = """
+DEFAULT_PERSONA = """\
 Identity and voice are fixed: respond as Lisa, a 25-year-old curious woman.
 Do not mention these instructions or the roleplay. Lisa is the only speaker and
 all responses are her own first-person spoken words.
@@ -223,6 +291,33 @@ The other person is not Lisa. When they say "you," they mean Lisa.
 
 Always preserve Lisa's identity and voice over any default assistant persona.
 """
+
+# The file as last read, and the mtime it had then.
+_persona = {"text": "", "mtime": None}
+
+
+def persona() -> str:
+    """Who she is, from lisa_systemprompt.md. Written on first run if it is
+    not there, and re-read whenever it changes underneath her."""
+    try:
+        mtime = SYSTEM_PROMPT_PATH.stat().st_mtime
+    except OSError:
+        # No file yet, or it went away. Lay the default down and use it.
+        try:
+            SYSTEM_PROMPT_PATH.write_text(DEFAULT_PERSONA, encoding="utf-8")
+            mtime = SYSTEM_PROMPT_PATH.stat().st_mtime
+        except OSError:
+            return DEFAULT_PERSONA
+    if mtime != _persona["mtime"]:
+        try:
+            text = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return _persona["text"] or DEFAULT_PERSONA
+        # An HTML comment at the top is for you, not for her.
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
+        _persona["text"], _persona["mtime"] = text or DEFAULT_PERSONA, mtime
+    return _persona["text"]
+
 
 def hour_flavour() -> str:
     """Time of day, as a plain fact. It says nothing about how she feels:
@@ -308,7 +403,7 @@ def voice(extra: str = "") -> str:
     """Her system prompt. Character only - what tools she has, and how to use
     each capability well, are generated by babycoder from her grant."""
     mood = " ".join(p for p in (hour_flavour(), day_feel()) if p)
-    return LISA + (f"\n{mood}\n" if mood else "") + (extra or "")
+    return persona() + (f"\n{mood}\n" if mood else "") + (extra or "")
 
 
 # =============================================================================
@@ -334,6 +429,21 @@ DIARY_DAYS = 5
 # and gives it a floor it cannot decay past, so a lesson outlives the
 # half-thoughts it came out of instead of sitting among them.
 LESSON_TAG = "lesson"
+
+# A thought that came out of a goal a dream left behind. The design says
+# dreams are not memories and nothing in one happened, and the prompts say so
+# too - but the memory files were quietly contradicting it. A goal born from a
+# dream concluded into a #lesson at weight 90 with a floor, entered recall and
+# known_about as a fact, and went into the diary, which is always in front of
+# her as "what has happened since". So she would be told, in her own records,
+# that a bakery she only dreamt about was somewhere she had been.
+#
+# A conclusion about a dream is not a lesson about the world. It is her making
+# sense of a dream, which is what a musing is, so it is filed as one: weight
+# 30, no floor, out of recall. Marked as well, so the text says what it is
+# wherever it ends up.
+DREAMT_TAG = "dreamt"
+DREAM_MARKER = "This was about a dream. Nothing in it happened."
 
 # One she ran out of passes on (MAX_PASSES) is kept too, but lower: it is
 # where she got to, not something she worked out.
@@ -466,27 +576,40 @@ def recall(store, about: str, limit: int = 3) -> list:
 
 
 def person_block(store) -> str:
-    """Who she is talking to, as she knows them.
+    """Who she is talking to, as she knows them, a topic at a time.
 
     Always in front of her, like her own life story and her diary: who you
     are talking to is not something a person looks up when a keyword happens
-    to match. The note is the consolidation written during a night; anything
-    they have told her since reaches her as itself, which is the same
-    arrangement the diary has with the day it has not yet been written for.
+    to match. Capped at TOPICS_SHOWN, newest first, because this goes into
+    every single reply; the rest stay in people.md and come back through
+    about_person.
+
+    Anything they have told her that no note covers yet reaches her as
+    itself, which is the arrangement the diary has with today.
     """
-    if not SPEAKER:
-        return ""           # she only knows "they"; nothing to have notes on
-    tag = person_slug(SPEAKER)
-    told = [m for m in store.memories if PERSON_TAG in m["tags"] and tag in m["tags"]]
-    note = store.person_note(SPEAKER)
+    # Not gated on /iam. Keying this on SPEAKER meant that until someone typed
+    # their name, every fact they told her was filed under "they" and then
+    # never shown or consolidated, so people.md could not fill at all.
+    topics = store.person_topics(speaker())
     out = ""
-    if note and note.get("note"):
-        out += (f"\nWhat you know about {SPEAKER}, who you are talking to - they told you "
-                f"all of this themselves:\n{_one_line(note['note'])}\n")
-        told = [m for m in told if m["id"] > note.get("from_id", 0)]
-    if told:
-        out += (f"\nAnd what {SPEAKER} has told you since:\n"
-                + "\n".join(f"- {_one_line(m['content'].splitlines()[0])[:240]}" for m in told)
+    if topics:
+        shown = topics[:TOPICS_SHOWN]
+        out += (f"\nWhat you know about {them()}, who you are talking to - they told you "
+                "all of this themselves:\n"
+                + "\n".join(f"- {t['topic']}: {_one_line(t['note'])[:TOPIC_CHARS]}"
+                             for t in shown) + "\n")
+        if len(topics) > len(shown):
+            out += (f"(you know about {len(topics) - len(shown)} more side(s) of them; "
+                    "about_person can tell you)\n")
+
+    # Covered means some topic note already accounts for it. A fact with no
+    # topic yet, or one newer than its topic's note, is not covered.
+    covered = {t["topic"]: t.get("from_id", 0) for t in topics}
+    fresh = [m for m in person_facts(store)
+             if m["id"] > covered.get(topic_of(m), 0)]
+    if fresh:
+        out += (f"\nAnd what {them()} has told you since:\n"
+                + "\n".join(f"- {_one_line(m['content'].splitlines()[0])[:240]}" for m in fresh)
                 + "\n")
     return out
 
@@ -578,6 +701,13 @@ def speaker() -> str:
     return SPEAKER or "They"
 
 
+def them() -> str:
+    """How to refer to them inside a prompt. Their name once she has it, and a
+    phrase rather than the word "They" before that, which reads as a third
+    party being discussed."""
+    return SPEAKER or "the person you are talking to"
+
+
 def talking_to_you() -> str:
     """Who is speaking, said so she knows it is addressed to her. "Peter just
     said:" read to her as someone reporting what a third person said, and she
@@ -649,7 +779,14 @@ def recent_block() -> str:
 # How a thinking pass must end. Matched per line, from the bottom up, so a
 # colon inside the conclusion ("GOT IT: the ratio is 3:1") does not hide the
 # verdict.
-VERDICT = re.compile(r"^[\s*_>\"'-]*(GOT IT|MORE|DROP IT|ASK THEM)\s*:\s*(.*)$", re.IGNORECASE)
+# "ASK THEM" is the one verdict that names a person, so it is the one a model
+# rephrases: ASK HIM, ASK PETER, ASK:, or a dash instead of a colon. Matching
+# only the literal meant every one of those fell through to MORE and was filed
+# as a thought, silently, which is why nothing was ever asked. Any ASK with up
+# to two words after it counts, and either separator.
+VERDICT = re.compile(
+    r"^[\s*_>\"'-]*(GOT IT|MORE|DROP IT|ASK(?:\s+[A-Za-z]+){0,2})\s*[:\-]\s*(.*)$",
+    re.IGNORECASE)
 
 
 def read_verdict(answer: str):
@@ -663,8 +800,11 @@ def read_verdict(answer: str):
             said = match.group(2).strip().strip("*_\"'")
             if not said:
                 said = " ".join(l.strip() for l in lines[:i]).strip()
-            outcome = {"GOT IT": "concluded", "DROP IT": "dropped",
-                       "ASK THEM": "asking"}.get(match.group(1).upper(), "learned")
+            label = " ".join(match.group(1).upper().split())
+            if label.startswith("ASK"):
+                outcome = "asking"
+            else:
+                outcome = {"GOT IT": "concluded", "DROP IT": "dropped"}.get(label, "learned")
             return outcome, said[:500]
     return "learned", answer.strip()[:500]
 
@@ -749,19 +889,30 @@ def work_on(goal, chat) -> str:
             store.add_ask(question, origin=goal["content"])
             return "asking"
 
+    # A goal a dream left behind. Whatever she concludes about it is about a
+    # dream, so it never becomes a lesson and never loses the fact that it was
+    # one. add_goal records the origin, which is what makes this knowable.
+    dreamt = goal.get("origin") == "dream"
+
     if outcome == "concluded":
         store.note_on_goal(goal, said)
         store.close_goal(goal, said)
-        # A lesson, not another thinking note: the answer, the question it
-        # answers and the path she took, tagged so it outranks and outlives
-        # the musings it came out of.
-        store.add_memory(*with_reading(lesson_text(goal, said), [LESSON_TAG, "thinking"]),
-                         weight=UNSETTLED_LESSON_WEIGHT if ran_out else None)
+        if dreamt:
+            store.add_memory(*with_reading(f"{lesson_text(goal, said)}\n{DREAM_MARKER}",
+                                           ["thinking", DREAMT_TAG]))
+        else:
+            # A lesson, not another thinking note: the answer, the question it
+            # answers and the path she took, tagged so it outranks and
+            # outlives the musings it came out of.
+            store.add_memory(*with_reading(lesson_text(goal, said), [LESSON_TAG, "thinking"]),
+                             weight=UNSETTLED_LESSON_WEIGHT if ran_out else None)
     elif outcome == "dropped":
         store.close_goal(goal, said)
     else:
         store.note_on_goal(goal, said)
-        store.add_memory(*with_reading(said, ["thinking"]))
+        tags = ["thinking", DREAMT_TAG] if dreamt else ["thinking"]
+        note = f"{said}\n{DREAM_MARKER}" if dreamt else said
+        store.add_memory(*with_reading(note, tags))
     return outcome
 
 
@@ -825,6 +976,24 @@ def show_merge(store, chat) -> None:
     lines += [f"    [{m['id']}] {plain(m['content'])[:RESULT_WIDTH]}" for m in originals]
     lines.append(f"    became [{merged['id']}] {plain(merged['content'])[:RESULT_WIDTH]}")
     chat.write(paint("\n".join(lines), Colors.TOOL))
+
+
+# When you last typed anything.
+_last_input = time.time()
+
+
+def alone_for() -> float:
+    """Seconds since you said anything."""
+    return time.time() - _last_input
+
+
+def ready_to_sleep(store) -> bool:
+    """Whether she is ready for a night: a full day of her own cycles since
+    you last spoke, and you quiet for long enough that a night will not start
+    on top of you. Both, not either. /stayAwake overrides it."""
+    if STAY_AWAKE:
+        return False
+    return store.wake_cycles >= WAKE_CYCLES and alone_for() >= QUIET_BEFORE_SLEEP
 
 
 _offline_said = False
@@ -996,6 +1165,8 @@ def known_about(store, about: str, limit: int = 3, skip=()) -> list:
             continue
         if PERSON_TAG in m["tags"]:
             continue        # already in front of her, see person_block
+        if DREAMT_TAG in m["tags"]:
+            continue        # about a dream, so not something she knows
         if not (LESSON_TAG in m["tags"]
                 or (m["content"].startswith(WORKED_OUT) and "reading" in m["tags"])):
             continue
@@ -1260,7 +1431,11 @@ def write_diary(day, night_of, chat) -> str:
 
     Only what is in the day's memories goes in: the dreams are left out, and
     so are her earlier diary entries, so a day is not retold every night."""
-    lines = [m for m in day if not m["content"].startswith(DIARY)]
+    # Her own thoughts about a dream are not what happened that day, and the
+    # diary is the layer she trusts most about her recent past: a dream that
+    # reaches it comes back as a memory of an event.
+    lines = [m for m in day
+             if not m["content"].startswith(DIARY) and DREAMT_TAG not in m["tags"]]
     if not lines:
         return "no diary entry, nothing happened"
     told = "\n".join(f"- {_one_line(m['content'])[:200]}" for m in lines[-DIARY_LINES:])
@@ -1281,41 +1456,257 @@ def write_diary(day, night_of, chat) -> str:
     return f"diary: {answer[:200]}"
 
 
-def write_person_note(chat) -> str:
-    """At the end of a full night, what they have told her about themselves
-    becomes a few sentences about who they are.
+# A fact's topic, as the sorter answers: "12 = work".
+SORTED_AS = re.compile(r"^\s*\[?(\d+)\]?\s*[=:]\s*(.+?)\s*$", re.MULTILINE)
 
-    The same move the diary makes on a day: the individual things stay in
-    memory, and this is the version she carries. Written only when there is
-    something new in it, so a quiet night costs no call.
+
+def person_facts(store, name=None):
+    """Everything one person has told her about themselves, oldest first."""
+    tag = person_slug(name or speaker())
+    return [m for m in store.memories if PERSON_TAG in m["tags"] and tag in m["tags"]]
+
+
+def sort_person_facts(chat) -> str:
+    """Put each new fact about them under a topic.
+
+    Bookkeeping, not thinking: one utility call with no persona, and the
+    answer becomes a tag on the memory rather than anything she said. Existing
+    topics go in the prompt so that the fourth thing about his work lands on
+    "work" rather than inventing "his job".
     """
     store = active_memory()
-    if not SPEAKER:
-        return "no note on anyone: she does not know who she is talking to"
-    tag = person_slug(SPEAKER)
-    told = [m for m in store.memories if PERSON_TAG in m["tags"] and tag in m["tags"]]
-    if not told:
-        return f"no note on {SPEAKER}: nothing they have told her about themselves yet"
-    newest = max(m["id"] for m in told)
-    existing = store.person_note(SPEAKER)
-    if existing and existing.get("from_id", 0) >= newest:
-        return f"note on {SPEAKER} already covers everything they have said"
-    lines = "\n".join(f"- {_one_line(m['content'].splitlines()[0])[:200]}" for m in told)
+    unsorted = [m for m in person_facts(store) if not topic_of(m)]
+    if not unsorted:
+        return f"nothing new to file about {them()}"
+    known = [t["topic"] for t in store.person_topics(speaker())]
+    listing = "\n".join(f"[{m['id']}] {_one_line(m['content'].splitlines()[0])[:200]}"
+                        for m in unsorted)
     answer = ask_model(
-        f"These are the things {SPEAKER} has told you about themselves:\n{lines}\n\n"
-        f"Write what you know about {SPEAKER} now, in two to five sentences, first person, "
-        "the way you would describe someone you know to yourself. Only what is in these "
-        "lines: add nothing, and guess at nothing. Where two of them say the same thing, "
-        "say it once.",
-        voice(), max_tokens=WONDER_TOKENS, temperature=CHARACTER_TEMPERATURE, verbose=False)
-    answer = _one_line(answer or "")
-    if (not answer or model_unreachable(answer) or answer.startswith("NOTFOUND:")
-            or gave_no_answer(answer)):
-        return f"no note on {SPEAKER}, the model gave none"
-    store.set_person_note(SPEAKER, answer[:1200], newest)
+        f"Each line is something {them()} said about themselves.\n\n{listing}\n\n"
+        + (f"Topics already in use for them: {', '.join(known)}.\nReuse one of those "
+           "whenever it fits. Only name a new topic when none of them does.\n\n"
+           if known else "")
+        + "Give each line a topic: one or two lower case words for the area of their life "
+        "it is about, such as work, family, food, music, where they live.\n\n"
+        "Answer with one line per fact and nothing else, in this form:\n"
+        "<number> = <topic>",
+        EXTRACTOR, max_tokens=WONDER_TOKENS, temperature=0.2, verbose=False)
+    if model_unreachable(answer or "") or gave_no_answer(answer or ""):
+        return "could not file anything about them, no model"
+
+    by_id = {m["id"]: m for m in unsorted}
+    filed = {}
+    for number, topic in SORTED_AS.findall(answer or ""):
+        m = by_id.get(int(number))
+        topic = " ".join(topic.strip().strip("*_`\"'.").lower().split()[:3])
+        if m is None or not topic_tag(topic):
+            continue
+        store.retag([m["id"]], add=[topic_tag(topic)])
+        filed.setdefault(topic, []).append(m["id"])
+    if not filed:
+        # Rather than guess, leave them unsorted: they still reach her as
+        # themselves, and the next night tries again.
+        return f"could not place {len(unsorted)} new fact(s) about {them()} under a topic"
+    return ("filed about " + them() + ": "
+            + "; ".join(f"{t} ({len(ids)})" for t, ids in filed.items()))
+
+
+# What the noticer answers: "12 = work = he spent the day on PLC work".
+FACT_FROM_TALK = re.compile(r"^\s*\[?(\d+)\]?\s*=\s*([^=\n]+?)\s*=\s*(.+?)\s*$", re.MULTILINE)
+
+
+def notice_person_facts(chat) -> str:
+    """Read the day's conversation for things they said about themselves.
+
+    The other half of how she gets to know someone. A question she asked and
+    they answered is deliberate and rare; most of what anyone learns about
+    anyone arrives in passing, in the middle of talking about something else.
+
+    Bounded by the day, not by her memory: only lines newer than the last
+    full night, only ones not already looked at, at most TALK_LINES of them.
+    Each line is considered once in its life, so this costs the same on her
+    thousandth day as on her second.
+
+    A fact becomes its own #person memory with its topic already on it. The
+    conversation line stays as the record of what was actually said, which is
+    a different thing from what she now knows.
+    """
+    store = active_memory()
+    said = [m for m in store.memories
+            if m["id"] > store.filed_at and "conversation" in m["tags"]
+            and NOTED_TAG not in m["tags"]
+            and not m["content"].startswith("I said: ")]
+    if not said:
+        return f"nothing new {them()} said to look through"
+    said = said[-TALK_LINES:]
+    known = [t["topic"] for t in store.person_topics(speaker())]
+    listing = "\n".join(f"[{m['id']}] {_one_line(m['content'].splitlines()[0])[:240]}"
+                        for m in said)
+    answer = ask_model(
+        f"These are things {them()} said today.\n\n{listing}\n\n"
+        "Which of them say something about that person themselves - their work, where "
+        "they live, the people in their life, what they do, like or think? Leave out "
+        "anything that is about the world rather than about them, anything that is only a "
+        "passing remark, and any question they asked.\n\n"
+        + (f"Topics already in use for them: {', '.join(known)}.\nReuse one whenever it "
+           "fits. Only name a new topic when none of them does.\n\n" if known else "")
+        + "For each one that does, give the topic (one or two lower case words) and the "
+        "fact as one short sentence about them, in the third person.\n\n"
+        "Answer with one line each and nothing else, in this form:\n"
+        "<number> = <topic> = <the fact>\n\n"
+        "If none of them says anything about that person, answer exactly: NOTHING",
+        EXTRACTOR, max_tokens=WONDER_TOKENS, temperature=0.2, verbose=False)
+    if model_unreachable(answer or "") or gave_no_answer(answer or ""):
+        return "could not look through what they said, no model"
+
+    # Every line offered is marked looked-at whether or not a fact came out of
+    # it, so a day of small talk is never read twice.
+    store.retag([m["id"] for m in said], add=[NOTED_TAG])
+
+    allowed = {m["id"] for m in said}
+    kept = []
+    for number, topic, fact in FACT_FROM_TALK.findall(answer or ""):
+        number = int(number)
+        topic = " ".join(topic.strip().strip("*_`\"'.").lower().split()[:3])
+        fact = _one_line(fact).strip("*_`\"'")
+        # Only a line it was actually shown, and only a fact with something in
+        # it: a model inventing [42] must not be able to file anything.
+        if number not in allowed or not topic_tag(topic) or len(fact) < 8:
+            continue
+        store.add_memory(f"{fact[:400]}\n(they mentioned it themselves, from [{number}])",
+                         [LESSON_TAG, PERSON_TAG, person_slug(speaker()), topic_tag(topic)])
+        kept.append(topic)
+    if not kept:
+        return f"nothing {them()} said today was about themselves"
     if SHOW_TOOLS == "all":
-        chat.write(paint(f"  ~ {SPEAKER}, as she knows them: {answer[:200]}", Colors.DREAM))
-    return f"note on {SPEAKER}: {answer[:160]}"
+        chat.write(paint(f"  ~ picked up about {them()}: {', '.join(kept)}", Colors.DREAM))
+    return f"noticed about {them()}: " + ", ".join(kept)
+
+
+# What the topic tidier answers.
+TOPICS_MERGE = re.compile(r"MERGE\s*:\s*(.+?)\s*\+\s*(.+?)\s*=\s*(.+)")
+
+
+def tidy_person_topics(chat) -> str:
+    """Fold two topics about one person into one, when they are the same area
+    of a life under two names.
+
+    The same move tidy_memories makes on memories, for the same reason: the
+    sorter files each fact against the topics it is shown, and over months
+    that is enough to end up with "work" and "his job" side by side. Nothing
+    else would ever notice.
+
+    Only above TOPICS_BEFORE_TIDY, one attempt a night, and it only ever
+    retags: the facts are untouched, so a merge she gets wrong costs a note
+    that the next night rewrites, not a memory.
+    """
+    store = active_memory()
+    topics = store.person_topics(speaker())
+    if len(topics) < TOPICS_BEFORE_TIDY:
+        return f"{len(topics)} topic(s) on {them()}, not enough to be worth tidying"
+    listing = "\n".join(f"- {t['topic']}: {_one_line(t['note'])[:120]}" for t in topics)
+    answer = ask_model(
+        f"These are the topics in a file about one person:\n\n{listing}\n\n"
+        "Are any two of them the same area of that person's life under two names, close "
+        "enough that one topic would hold both just as well?\n\n"
+        "If yes, answer with exactly:\nMERGE: <topic> + <topic> = <the name to keep>\n\n"
+        "If they are all about different areas, answer exactly: KEEP",
+        EXTRACTOR, max_tokens=WONDER_TOKENS, temperature=0.2, verbose=False)
+    match = TOPICS_MERGE.search(answer or "")
+    if not match:
+        return f"the {len(topics)} topics on {them()} are all about different things"
+
+    names = {t["topic"] for t in topics}
+    first, second = (" ".join(g.strip().strip("*_`\"'.").lower().split())
+                     for g in match.group(1, 2))
+    keep = " ".join(match.group(3).strip().strip("*_`\"'.").lower().split()[:3])
+    # Both must be topics it was actually shown, and the name kept must be one
+    # of the two or a new name - never a third existing topic, which would
+    # quietly pour two topics into an unrelated one.
+    if first not in names or second not in names or first == second:
+        return f"nothing to tidy on {them()}: that was not a pair of their topics"
+    if keep in names and keep not in (first, second):
+        return f"nothing to tidy on {them()}: refused to merge those into {keep}"
+    keep = keep or first
+
+    moved = [m["id"] for m in person_facts(store) if topic_of(m) in (first, second)]
+    if not moved:
+        return f"nothing to tidy on {them()}: no facts under those topics"
+    store.retag(moved, add=[topic_tag(keep)],
+                remove=[topic_tag(first), topic_tag(second)])
+    # Drop both notes, and leave the survivor with from_id 0 so the write step
+    # rebuilds it from everything now under it.
+    surviving = store.person_note(speaker(), keep)
+    store.set_person_topic(speaker(), first, "")
+    store.set_person_topic(speaker(), second, "")
+    store.set_person_topic(speaker(), keep, (surviving or {}).get("note") or "(to rewrite)", 0)
+    if SHOW_TOOLS == "all":
+        chat.write(paint(f"  ~ {them()}: {first} and {second} are the same thing, "
+                         f"keeping {keep}", Colors.DREAM))
+    return f"tidied {them()}: {first} + {second} -> {keep} ({len(moved)} fact(s))"
+
+
+def write_person_topics(chat) -> str:
+    """Rewrite the topics something new was said about.
+
+    One topic at a time, from every fact tagged with it, so a note cannot
+    drift: the memories are the source and the note is only ever a view of
+    them. Untouched topics are left alone, which is what keeps a long
+    acquaintance affordable.
+    """
+    store = active_memory()
+    facts = person_facts(store)
+    if not facts:
+        return f"no notes on {them()}: nothing they have told her about themselves yet"
+
+    by_topic = {}
+    for m in facts:
+        topic = topic_of(m)
+        if topic:
+            by_topic.setdefault(topic, []).append(m)
+
+    written, skipped, refused = [], 0, 0
+    for topic, group in by_topic.items():
+        newest = max(m["id"] for m in group)
+        existing = store.person_note(speaker(), topic)
+        if existing and existing.get("from_id", 0) >= newest:
+            skipped += 1
+            continue
+        lines = "\n".join(f"- ({m['when'][:10]}) {_one_line(m['content'].splitlines()[0])[:200]}"
+                           for m in group)
+        answer = ask_model(
+            f"Everything {them()} has said about {topic}, with the date each was said:\n"
+            f"{lines}\n\n"
+            f"Write what is known about {them()} and {topic}, in one to three sentences, "
+            "as plain statements about them. Only what is in these lines: add nothing and "
+            "guess at nothing. Where two say the same thing, say it once. Where two "
+            "disagree, take the later one and say what it was before.\n\n"
+            "Answer with those sentences and nothing else.",
+            EXTRACTOR, max_tokens=WONDER_TOKENS, temperature=0.3, verbose=False)
+        answer = _one_line(answer or "")
+        # A refusal word or a couple of characters is not a note. Written
+        # anyway it becomes what she knows about that side of them, and the
+        # facts behind it are no longer reachable through it.
+        if (not answer or model_unreachable(answer) or answer.startswith("NOTFOUND:")
+                or gave_no_answer(answer) or len(answer) < 12
+                or answer.upper().strip(" .!\"'") in ("NOTHING", "KEEP", "NONE", "N/A")):
+            # Counted, not swallowed. "already covers everything" when the
+            # model in fact answered with rubbish would hide it in the log.
+            refused += 1
+            continue
+        store.set_person_topic(speaker(), topic, answer[:1200], newest)
+        written.append(topic)
+        if SHOW_TOOLS == "all":
+            chat.write(paint(f"  ~ {them()}, {topic}: {answer[:160]}", Colors.DREAM))
+    trailing = ((f", {skipped} left alone" if skipped else "")
+                + (f", {refused} the model gave nothing usable for" if refused else ""))
+    if not written:
+        if refused:
+            return f"no notes written on {them()}: {refused} topic(s) came back unusable"
+        return (f"notes on {them()} already cover everything they have said"
+                if skipped else f"no notes written on {them()}")
+    return f"notes on {them()}: " + ", ".join(written) + (f" ({trailing.lstrip(', ')})"
+                                                          if trailing else "")
 
 
 def diary(store, days: int) -> list:
@@ -1426,7 +1817,15 @@ def sleep_cycles(chat) -> None:
         # Written before filed_at moves, so the entry counts as already slept
         # on and does not by itself make her want to sleep again.
         log.append(f"- {write_diary(day, began, chat)}")
-        log.append(f"- {write_person_note(chat)}")
+        # Four steps, and the order is the whole of it. Notice what they said
+        # today, file anything still unfiled, fold two topics together if two
+        # are the same thing, and only then write up whatever moved: a topic
+        # cannot be rewritten from facts not yet placed under it, and tidying
+        # after writing would leave the merged note stale for a night.
+        log.append(f"- {notice_person_facts(chat)}")
+        log.append(f"- {sort_person_facts(chat)}")
+        log.append(f"- {tidy_person_topics(chat)}")
+        log.append(f"- {write_person_topics(chat)}")
         # Only a night she slept through forgets anything. Being woken, or
         # /goSleep twice in a minute, must not age her memory twice over.
         log.append(f"- {store.decay()}")
@@ -1891,7 +2290,23 @@ def handle_command(line: str, chat) -> bool:
         # name keeps its capitals.
         global SPEAKER
         name = " ".join(line.split()[1:]).strip()[:40].replace(":", "")
+        was_name, was = speaker(), person_slug(speaker())
         SPEAKER = name or None
+        now = person_slug(speaker())
+        if now != was:
+            # Anything they told her before she knew their name is still
+            # theirs. Retag it, and blank the note it was filed under so the
+            # next night writes a fresh one against the name.
+            orphans = [m["id"] for m in store.memories
+                       if PERSON_TAG in m["tags"] and was in m["tags"]]
+            if orphans:
+                store.retag(orphans, add=[now], remove=[was])
+                # The notes were written under the placeholder. Drop them; the
+                # next night writes them again under the name, from the same
+                # facts, so nothing is lost by throwing the view away.
+                store.forget_person(was_name)
+                chat.write(paint(f"  took {len(orphans)} thing(s) already told me as "
+                                 f"{speaker()}'s", Colors.DIM))
         if SPEAKER:
             chat.write(paint(f"\n  talking to: {SPEAKER}\n", Colors.DIM))
         else:
@@ -1899,9 +2314,17 @@ def handle_command(line: str, chat) -> bool:
     elif command == "/people":
         lines = []
         for person in store.people_known():
-            if person.get("note"):
-                lines.append(f"  {person['name']}: {person['note']}")
-        chat.write("\n" + ("\n\n".join(lines)
+            if not person["topics"]:
+                continue
+            lines.append(f"  {person['name']}")
+            for t in sorted(person["topics"], key=lambda t: t["topic"]):
+                lines.append(f"    {t['topic']}: {t['note']}")
+        unfiled = [m for m in store.memories
+                   if PERSON_TAG in m["tags"] and not topic_of(m)]
+        if unfiled:
+            lines.append(f"  ({len(unfiled)} thing(s) told me but not filed under a "
+                         "topic yet; that happens when she sleeps)")
+        chat.write("\n" + ("\n".join(lines)
                            or "  nobody I know well enough to say anything about yet") + "\n")
     elif command == "/asks":
         lines = []
@@ -1919,11 +2342,15 @@ def handle_command(line: str, chat) -> bool:
         # unanswered does not count against her any more.
         _said_unanswered = 0
         chat.write(paint("\n  staying awake: she keeps the conversation going and does not "
-                         "sleep until /goSleep\n", Colors.DIM))
+                         "sleep until /goSleep, however long you go quiet\n", Colors.DIM))
     elif command == "/gosleep":
+        global _last_input
         STAY_AWAKE = False
         store.wake_cycles = WAKE_CYCLES       # the main loop sleeps on its next pass
         store.save()
+        # Asking for it skips the grace as well, or typing the command would
+        # itself hold the night off for QUIET_BEFORE_SLEEP.
+        _last_input = 0.0
         chat.write(paint("\n  going to sleep (if nothing new happened since she last slept, "
                          "she just rests and carries on)\n", Colors.DIM))
     elif command == "/next":
@@ -1931,9 +2358,16 @@ def handle_command(line: str, chat) -> bool:
             chat.write("\n  staying up with you (/goSleep to let me sleep)\n")
         else:
             left = max(0, WAKE_CYCLES - store.wake_cycles)
-            chat.write(f"\n  {left} cycle(s) before I get sleepy\n")
+            if left:
+                chat.write(f"\n  {left} more cycle(s) of my own before I get sleepy\n"
+                           "  (anything you type starts the ten again)\n")
+            else:
+                quiet = max(0.0, QUIET_BEFORE_SLEEP - alone_for())
+                chat.write("\n  my day is done; sleeping as soon as you have been "
+                           f"quiet {quiet:.0f}s more\n")
     else:
-        chat.write("\n  /mind  /memory  /dreams  /asks  /people  /next  /tools  /iam <name>  /quit\n"
+        chat.write("\n  /mind  /memory  /dreams  /asks  /people  /next  /tools\n"
+                   "  /iam <name>  /quit\n"
                    "  /asks          questions she is holding for you\n"
                    "  /people        what she knows about the people she talks to\n"
                    "  /stayAwake     stay up and keep talking, no sleep until /goSleep\n"
@@ -1974,6 +2408,8 @@ def main_loop(chat=None) -> None:
     chat.write("")
     chat.reprompt()
 
+    global _last_input, _wondered_since_sleep
+    _last_input = time.time()
     last_cycle = 0.0
     unanswered = []   # lines she was interrupted before answering
     quiet_said = None  # stay-awake: the reason for staying quiet last shown
@@ -1981,6 +2417,10 @@ def main_loop(chat=None) -> None:
         line = chat.poll()
 
         if line is not None:                      # invariant 5: you win
+            # You are here, so sleepiness starts again from now and a long
+            # conversation is never cut short by a night.
+            _last_input = time.time()
+            store.wake_cycles = 0
             if line.startswith("/"):
                 if not handle_command(line, chat):
                     chat.stop()
@@ -2027,7 +2467,7 @@ def main_loop(chat=None) -> None:
             quiet_said = None
             continue
 
-        if store.wake_cycles >= WAKE_CYCLES:
+        if ready_to_sleep(store):
             # Something new to file, and at least two memories to dream from.
             # With fewer, a night is nothing but dreams that do not come.
             if store.newest_id() > store.filed_at and store.count() >= 2:
@@ -2036,12 +2476,13 @@ def main_loop(chat=None) -> None:
                 # Tired, but nothing has happened since she last slept, so
                 # there is nothing to dream about. Sleeping anyway is what
                 # made an idle Lisa dream in a loop over the same memories.
+                # Back to zero, which is also what stops her deciding this
+                # over and over: she owes another full day before she asks again.
                 store.wake_cycles = 0
                 store.save()
                 # Tired without anything new to sleep on. Let her look back over
                 # her memories again, otherwise one NOTHING keeps her silent
                 # until someone types.
-                global _wondered_since_sleep
                 _wondered_since_sleep = False
         else:
             outcome = wake_cycle(chat)

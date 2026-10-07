@@ -135,10 +135,19 @@ def pick_memories(pool, n, sampling="uniform", filed_at=0, now=None):
     return sorted(picked, key=lambda p: p[0]["id"])
 
 
+# A thought she had about a dream is not lived material. Dreams weave from
+# what happened, never from other dreams, and a musing about last night's
+# dream is the same echo by a longer route: the dream becomes a thought, the
+# thought becomes dream material, and the following night dreams the dream
+# again. Tagged by the agent that files it (lisa_agent.DREAMT_TAG).
+NOT_LIVED = "dreamt"
+
+
 @tool("Dream about a few memories picked at random.")
 def dream(system_prompt="", sample=3, sampling="uniform"):
     mem = active_memory()
-    pool = [m for m in mem.memories if not about_machinery(m["content"])]
+    pool = [m for m in mem.memories
+            if not about_machinery(m["content"]) and NOT_LIVED not in m["tags"]]
     if len(pool) < 2:
         return "NOTFOUND: not enough lived material to dream about yet"
     # Rest what the last two dreams used, while there is enough else to dream

@@ -18,10 +18,17 @@ AGENT MEMORY toolkit: long-term memory, per agent, as plain markdown files in
                hand and its tags decide the starting value.
   goals.md     what is on her mind, open and recently closed.
   people.md    what she knows about the people she talks to. One section per
-               person, rewritten during a full night from the things they have
-               told her, the way a diary entry is written from a day. The
-               individual #person memories stay in memories.md; this is the
-               consolidation, and it is always in front of her rather than
+               person, and under it one per topic - work, family, food - each
+               a sentence or two rewritten during a full night from the things
+               they said about that topic.
+
+               Per topic rather than one note per person, because one note has
+               a length and a person does not: past it the oldest things
+               quietly stopped being remembered. A topic grows only as wide as
+               the topic, and a new one costs nothing.
+
+               The individual #person memories stay in memories.md; this is
+               the consolidation, and it is always in front of her rather than
                waiting to be recalled - who you are talking to is not
                something you look up.
   asks.md      questions she is holding for the person she talks to - things
@@ -213,6 +220,9 @@ MEMORY_HEADER = re.compile(r"^## \[(\d+)\]\s*(?:\(weight\s+(\d+)\)\s*)?(.*)$")
 GOAL_HEADER = re.compile(r"^## (open|closed): (.*)$")
 ASK_HEADER = re.compile(r"^## (waiting|asked|answered|stale): (.*)$")
 PERSON_HEADER = re.compile(r"^## (\S.*?)\s*$")
+TOPIC_HEADER = re.compile(r"^### (\S.*?)\s*$")
+# What a note loaded from the older one-note-per-person format becomes.
+GENERAL_TOPIC = "in general"
 DREAM_HEADER = re.compile(r"^## (\S+ \S+)(?:\s+\(from (.*)\))?\s*$")
 
 
@@ -232,8 +242,8 @@ class MemorySystem:
         # waiting when he does not pick it up, or stale once she has offered
         # it enough times.
         self.asks = []
-        # What she knows about each person she talks to: name, the note
-        # itself, when it was written and the newest memory it covers.
+        # What she knows about each person she talks to: one entry per
+        # person, holding one note per topic.
         self.people = []
         self.wake_cycles = 0
         # Number of the newest memory when sleep last finished. Anything newer
@@ -433,78 +443,150 @@ class MemorySystem:
     # -- people.md -------------------------------------------------------------
 
     def _load_people(self):
-        people, current = [], None
+        """Read people.md. Also understands the older format, one unlabelled
+        note per person, which becomes that person's "in general" topic."""
+        people, person, topic = [], None, None
         for line in self._read("people"):
-            if line.startswith("#") and not line.startswith("## "):
+            heading = TOPIC_HEADER.match(line)
+            if heading and person is not None:
+                topic = {"topic": heading.group(1).strip().lower(), "note": [],
+                         "updated": _now(), "from_id": 0}
+                person["topics"].append(topic)
+                continue
+            heading = PERSON_HEADER.match(line)
+            if heading:
+                person = {"name": heading.group(1).strip(), "topics": []}
+                people.append(person)
+                topic = None
+                continue
+            if line.startswith("#"):
                 continue                      # the file's own title
-            header = PERSON_HEADER.match(line)
-            if header:
-                current = {"name": header.group(1).strip(), "note": [],
-                           "updated": _now(), "from_id": 0}
-                people.append(current)
+            if person is None:
                 continue
-            if current is None:
-                continue
+            if topic is None:
+                # Body before any ### heading: the older format. Give it a
+                # topic so nothing the previous version wrote is lost.
+                if not line.strip():
+                    continue
+                topic = {"topic": GENERAL_TOPIC, "note": [],
+                         "updated": _now(), "from_id": 0}
+                person["topics"].append(topic)
             if line.startswith("- updated:"):
-                current["updated"] = line.partition(":")[2].strip() or _now()
+                topic["updated"] = line.partition(":")[2].strip() or _now()
             elif line.startswith("- from_id:"):
                 try:
-                    current["from_id"] = int(line.partition(":")[2].strip())
+                    topic["from_id"] = int(line.partition(":")[2].strip())
                 except ValueError:
                     pass
             else:
-                current["note"].append(line)
+                topic["note"].append(line)
         for person in people:
-            person["note"] = "\n".join(person["note"]).strip()
+            for t in person["topics"]:
+                t["note"] = "\n".join(t["note"]).strip()
+            # An empty section, from a note that was blanked, is not a topic.
+            person["topics"] = [t for t in person["topics"] if t["note"]]
         self.people = people
 
     def _save_people(self):
         out = ["# People\n",
-               "<!-- What she knows about each person she talks to, written during a full "
-               "night from the things they have told her. Edit or add a section by hand the "
-               "same way; she rereads this file when it changes. from_id is the newest "
-               "memory the note covers - anything newer reaches her as itself until the "
-               "next night rewrites this. -->\n"]
+               "<!-- What she knows about each person she talks to. '## Name' is a person, "
+               "'### topic' is one area of their life, and the lines under it are what she "
+               "knows about it, rewritten during a full night from the things they said "
+               "about that topic. Edit or add either by hand the same way; she rereads this "
+               "file when it changes. from_id is the newest memory a topic covers - "
+               "anything newer reaches her as itself until the next night folds it in. -->\n"]
         for person in self.people:
-            out.append(f"## {person['name']}")
-            out.append(f"- updated: {person.get('updated', '')}")
-            out.append(f"- from_id: {person.get('from_id', 0)}")
-            # A body line starting "## " would split the section in two when
-            # it is read back. Indent it one space.
-            out.append(re.sub(r"^## ", " ## ", person.get("note", ""), flags=re.MULTILINE))
-            out.append("")
+            out.append(f"## {person['name']}\n")
+            for t in person["topics"]:
+                out.append(f"### {t['topic']}")
+                out.append(f"- updated: {t.get('updated', '')}")
+                out.append(f"- from_id: {t.get('from_id', 0)}")
+                # A body line starting with a heading marker would split the
+                # section when it is read back. Indent it one space.
+                out.append(re.sub(r"^(#{2,3}) ", r" \1 ", t.get("note", ""), flags=re.MULTILINE))
+                out.append("")
         _write_atomic(self.paths["people"], "\n".join(out) + "\n")
         self._mark("people")
 
-    def person_note(self, name):
-        """What she knows about someone, by name, or None. Case does not
-        matter: /iam peter and /iam Peter are the same person."""
-        self._sync()
+    def _person(self, name, create=False):
         wanted = " ".join(str(name or "").lower().split())
         if not wanted:
             return None
         found = next((p for p in self.people
                       if " ".join(p["name"].lower().split()) == wanted), None)
+        if found is None and create:
+            found = {"name": str(name), "topics": []}
+            self.people.append(found)
+        return found
+
+    def person_topics(self, name):
+        """Every topic she has notes on for this person, most recently
+        written first."""
+        self._sync()
+        person = self._person(name)
+        if not person:
+            return []
+        return sorted((dict(t) for t in person["topics"]),
+                      key=lambda t: t.get("updated", ""), reverse=True)
+
+    def person_note(self, name, topic=None):
+        """One topic's note for someone, or with no topic every topic at
+        once. None when she knows nothing about them. Case does not matter:
+        /iam peter and /iam Peter are the same person."""
+        self._sync()
+        topics = self.person_topics(name)
+        if not topics:
+            return None
+        if topic is None:
+            return {"name": self._person(name)["name"], "topics": topics,
+                    "note": "\n".join(f"{t['topic']}: {t['note']}" for t in topics),
+                    "from_id": max(t.get("from_id", 0) for t in topics)}
+        wanted = " ".join(str(topic).lower().split())
+        found = next((t for t in topics
+                      if " ".join(t["topic"].lower().split()) == wanted), None)
         return dict(found) if found else None
 
-    def set_person_note(self, name, note, from_id=0):
-        """Replace what she knows about someone. Replaced rather than
-        appended: the note is a consolidation of every #person memory, so
-        adding to it would say the same things twice."""
+    def set_person_topic(self, name, topic, note, from_id=0):
+        """Replace what she knows about one topic for one person. Replaced
+        rather than appended: a topic note is a consolidation of the memories
+        tagged with that topic, so adding to it would say the same things
+        twice. An empty note removes the topic.
+
+        Only the topic named is touched, which is what makes this cheap: a
+        night rewrites the one or two topics something was said about and
+        leaves the rest of a long acquaintance alone."""
         self._sync()
-        wanted = " ".join(str(name).lower().split())
-        found = next((p for p in self.people
-                      if " ".join(p["name"].lower().split()) == wanted), None)
+        person = self._person(name, create=True)
+        wanted = " ".join(str(topic).lower().split()) or GENERAL_TOPIC
+        note = str(note).strip()
+        found = next((t for t in person["topics"]
+                      if " ".join(t["topic"].lower().split()) == wanted), None)
+        if not note:
+            person["topics"] = [t for t in person["topics"] if t is not found]
+            self._save_people()
+            return None
         if found is None:
-            found = {"name": str(name), "note": "", "updated": _now(), "from_id": 0}
-            self.people.append(found)
-        found["note"], found["from_id"], found["updated"] = str(note).strip(), int(from_id), _now()
+            found = {"topic": wanted, "note": "", "updated": _now(), "from_id": 0}
+            person["topics"].append(found)
+        found["note"], found["from_id"], found["updated"] = note, int(from_id), _now()
         self._save_people()
         return dict(found)
 
+    def forget_person(self, name):
+        """Drop everything written about someone. Used when a placeholder
+        turns out to be a named person and the notes move to the name."""
+        self._sync()
+        person = self._person(name)
+        if not person:
+            return False
+        self.people = [p for p in self.people if p is not person]
+        self._save_people()
+        return True
+
     def people_known(self):
         self._sync()
-        return [dict(p) for p in self.people]
+        return [{"name": p["name"], "topics": [dict(t) for t in p["topics"]]}
+                for p in self.people]
 
     # -- dreams.md -------------------------------------------------------------
 
@@ -816,6 +898,27 @@ class MemorySystem:
         self._save_state()
         return (f"weights: {lowered} faded a little, {floored} already at their floor "
                 f"(x{factor} a night)")
+
+    def retag(self, ids, add=(), remove=()):
+        """Change the tags on some memories. Used when something that was
+        filed under a placeholder turns out to belong to a named subject: the
+        facts someone told her before she knew their name are theirs, and
+        orphaning them would mean she had to be introduced before she could
+        remember anything."""
+        self._sync()
+        ids = {int(i) for i in ids}
+        add, remove = list(add), set(remove)
+        changed = False
+        for m in self._memories:
+            if m["id"] not in ids:
+                continue
+            tags = [t for t in m["tags"] if t not in remove]
+            tags += [t for t in add if t not in tags]
+            if tags != m["tags"]:
+                m["tags"], changed = tags, True
+        if changed:
+            self._save_memories()
+        return changed
 
     def delete(self, ids):
         self._sync()
@@ -1173,14 +1276,23 @@ def goal_close(index, outcome):
     return f"let go of: {goal['content'][:50]}"
 
 
-@tool("What you know about someone you have talked to, by name. Use it when they "
-      "mention a person, or when you want to recall who someone is.", name=P("string"))
-def about_person(name):
+@tool("What you know about someone you have talked to, by name: everything, or one "
+      "topic of their life such as work or family. Use it when they mention a person, "
+      "or when you want to recall who someone is.",
+      name=P("string"), topic=P("string", optional=True))
+def about_person(name, topic=None):
     mem = active_memory()
-    found = mem.person_note(name)
-    if found and found["note"]:
+    found = mem.person_note(name, topic)
+    if found and found.get("note"):
+        if topic:
+            return f"{found['topic']}: {found['note']}"
         return found["note"]
-    known = ", ".join(p["name"] for p in mem.people_known() if p["note"])
+    topics = mem.person_topics(name)
+    if topics and topic:
+        return _soft_not_found(
+            f"anything about {name} and", str(topic),
+            "Topics you have something on: " + ", ".join(t["topic"] for t in topics) + ".")
+    known = ", ".join(p["name"] for p in mem.people_known() if p["topics"])
     return _soft_not_found("anyone called", str(name),
                            f"People you know something about: {known}." if known
                            else "You have not got to know anyone well enough yet.")
