@@ -3,8 +3,9 @@
 
 # BabyCoder
 
-A small Python toolbox for running agents on small, local LLMs.
+A small Python toolbox for running small agents on local hardware.
 And two very different agents built with it.
+*(could be used with larger remote llm's as well)*
 
 The idea behind all of it: small models are good at judgment in the moment
 and bad at holding things in mind. So Python as a layer in between the user and LLM.
